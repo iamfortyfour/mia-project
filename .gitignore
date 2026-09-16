@@ -1,0 +1,15 @@
+# Runtime state and generated artifacts
+tasks/settings.json
+tasks/T-*.md
+bin/__pycache__/
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+.cache/
+
+# Local editor/OS files
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+Mia — терминальное рабочее место системы (curses, без внешних зависимостей).
+
+Идея: это не лог и не таблица, а интерфейс. Слева — вкладки с живыми данными,
+справа — питомец, который отражает состояние системы реальными метриками:
+  сыт   ← запас бесплатных квот      (quantum: сколько осталось)
+  бодр  ← скорость ответов (p95)     (быстрее отвечает — живее выглядит)
+  жив   ← ок-рейт моделей            (доля успешных обращений)
+  лвл   ← сколько запросов система отработала (опыт растёт от работы, не от времени)
+Ачивки выдаются за реальные заслуги из базы, а не за красивые слова.
+
+Клавиши: печатай и жми Enter — обращение к системе (поиск знания: тема → слова → смысл).
+  Tab / F1-F6 — вкладки · Esc — отмена · Ctrl+R — обновить · Ctrl+C — выход
+  ↑↓ PgUp/PgDn — прокрутка ответа
+Команды: :limits :profiles :metrics :models :know :pet :hot :cold :clear :quit
+"""
+import curses
+import json
+import os
+import random
+import sqlite3
+import subprocess
+import time
+import urllib.request
+from datetime import datetime
+
+DB = os.path.expanduser(os.environ.get("AGENTDB") or "~/agentdb/agent.db")
+DB_CLI = os.path.expanduser("~/.local/bin/db")
+URL = os.environ.get("LADDER_URL", "http://127.0.0.1:8787")
+
+# ---------------------------------------------------------------- пиксель-арт
+BIG = {
+    "N": ["█▄  █", "█ ▀ █", "█   █"],
+    "E": ["█████", "██▀▀▀", "█████"],
+    "X": ["█   █", " █▄█ ", "█   █"],
+    "U": ["█   █", "█   █", "▀▄▄▄▀"],
+    "S": ["▄▀▀▀▀", " ▀▀▄ ", "▀▀▀▀▄"],
+}
+# питомец: 4 кадра (спокойный · моргает · весел · спит) + сытый и голодный вид
+PET = {
+    "idle":  ["   ▄▀▀▀▀▄   ", "  █  ● ●  █  ", "  █   ◡   █  ", "   ▀▄▄▄▄▄▀   ", "    ▀   ▀    "],
+    "blink": ["   ▄▀▀▀▀▄   ", "  █  ─ ─  █  ", "  █   ◡   █  ", "   ▀▄▄▄▄▄▀   ", "    ▀   ▀    "],
+    "happy": ["  ▄ ▄▀▀▀▀▄ ▄ ", "  █  ▲ ▲  █  ", "  █  ◡◡◡  █  ", "   ▀▄▄▄▄▄▀   ", "   ▀     ▀   "],
+    "sleep": ["   ▄▀▀▀▀▄   ", "  █  ─ ─  █  ", "  █   o   █  ", "   ▀▄▄▄▄▄▀z  ", "    ▀   ▀  z "],
+    "sick":  ["   ▄▀▀▀▀▄   ", "  █  × ×  █  ", "  █   ︿   █  ", "   ▀▄▄▄▄▄▀   ", "    ▀   ▀    "],
+    "work":  ["   ▄▀▀▀▀▄   ", "  █  ◉ ◉  █  ", "  █   ▭   █  ", "   ▀▄▄▄▄▄▀   ", "   ▄▀ ▀▄ ▀▄  "],
+}
+TIPS = [
+    "спроси систему как обычный поиск: «почему турбо выключать нельзя»",
+    "db hot покажет, какие знания реально нужны, db cold — какие лежат зря",
+    "db models — кто из моделей сколько отработал и с каким успехом",
+    "ladder doctor — где у маршрутов узкое место и перекос на одном провайдере",
+    "питомец сыт, пока есть запас бесплатных квот; не голодай его зря",
+]
+
+
+def fetch_json(path, timeout=2.5):
+    try:
+        with urllib.request.urlopen(URL + path, timeout=timeout) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
+def sql(q, params=()):
+    try:
+        con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2)
+        con.row_factory = sqlite3.Row
+        out = [dict(r) for r in con.execute(q, params)]
+        con.close()
+        return out
+    except Exception:
+        return []
+
+
+def load_limits():
+    data = fetch_json("/usage")
+    if not data:
+        return [], None
+    rows = []
+    for p in data.get("providers", []):
+        d = (p.get("limits") or {}).get("daily") or 0
+        if p.get("tier") != "free" or not p.get("key") or not d or not p.get("enabledModels"):
+            continue
+        left = p.get("remainingDaily") or 0
+        rows.append({"id": p["id"], "left": left, "lim": d, "used": p.get("requestsToday") or 0,
+                     "pct": int(100 * left / d) if d else 0,
+                     "rpm": (p.get("limits") or {}).get("rpm") or "-"})
+    rows.sort(key=lambda r: r["pct"])
+    return rows, data
+
+
+def load_profiles():
+    return ((fetch_json("/doctor?tokens=40000", timeout=4) or {}).get("profiles", []))
+
+
+def load_metrics():
+    return sql("SELECT name, value, unit, max(ts) last FROM metrics GROUP BY name ORDER BY name")
+
+
+def load_models():
+    return sql("""SELECT rung, provider, count(*) fires, sum(status='ok') ok, sum(status='empty') empty,
+                         sum(status IN ('fail','exhausted')) fails,
+                         round(avg(CASE WHEN ms IS NOT NULL THEN ms END)) avg_ms
+                  FROM outcomes WHERE rung IS NOT NULL GROUP BY rung ORDER BY fires DESC LIMIT 12""")
+
+
+def load_knowledge():
+    hot = sql("""SELECT n.key, n.title, count(*) reads FROM note_access a
+                 LEFT JOIN notes n ON n.id=a.note_id WHERE a.ts >= datetime('now','-30 day')
+                 GROUP BY a.note_id ORDER BY reads DESC LIMIT 8""")
+    cold = sql("""SELECT count(*) n FROM notes n WHERE n.status='active'
+                  AND NOT EXISTS (SELECT 1 FROM note_access a WHERE a.note_id=n.id
+                                  AND a.ts >= datetime('now','-30 day'))""")
+    total = sql("SELECT count(*) n FROM notes WHERE status='active'")
+    return hot, (cold[0]["n"] if cold else 0), (total[0]["n"] if total else 0)
+
+
+def load_journal():
+    """Живая лента: последние попытки системы — видно, как она дышит."""
+    return sql("""SELECT ts, profile, rung, status, attempt, ms, needed FROM outcomes
+                  ORDER BY ts DESC LIMIT 16""")
+
+
+def load_pet():
+    """Состояние питомца — только из реальных цифр системы."""
+    m = {r["name"]: r["value"] for r in load_metrics()}
+    limits, _ = load_limits()
+    left = sum(r["left"] for r in limits)
+    cap = sum(r["lim"] for r in limits) or 1
+    ok = m.get("llm.ok_rate") or 0
+    p95 = m.get("llm.latency_p95") or 9999
+    reqs = int(m.get("llm.requests.total") or 0)
+    notes = len(sql("SELECT 1 FROM notes WHERE status='active'"))
+    last = sql("SELECT max(ts) t, sum(substr(datetime(ts/1000,'unixepoch'),12,2) BETWEEN '00' AND '05') night "
+               "FROM outcomes")
+    night = (last[0]["night"] or 0) if last else 0
+    food = int(100 * left / cap)
+    alive = int(max(0, min(100, ok)))
+    swift = int(max(0, min(100, 100 - min(p95, 6000) / 60)))       # 0 мс → 100, 6 с → 0
+    level = 1 + reqs // 100
+    xp = reqs % 100
+    badges = []
+    if reqs >= 100: badges.append("сотня")
+    if reqs >= 500: badges.append("тысячник")
+    if alive >= 80: badges.append("снайпер")
+    if food >= 70: badges.append("сытый")
+    if notes >= 15: badges.append("хранитель")
+    if night >= 1: badges.append("ночной страж")
+    if not badges: badges.append("новичок")
+    return {"food": food, "alive": alive, "swift": swift, "level": level, "xp": xp,
+            "reqs": reqs, "notes": notes, "badges": badges,
+            "mood": "sleep" if alive < 40 else "sick" if alive < 60 else
+                    "happy" if food >= 60 and alive >= 80 else "idle"}
+
+
+def ask_system(q):
+    try:
+        p = subprocess.run([DB_CLI, "find", q, "--limit", "4"], capture_output=True, text=True, timeout=90)
+        return (p.stdout or p.stderr or "").strip().splitlines()
+    except Exception as e:
+        return [f"ошибка обращения: {e}"]
+
+
+def bar(pct, width, glyph="█"):
+    pct = max(0, min(100, int(pct)))
+    f = int(width * pct / 100)
+    return glyph * f + "░" * (width - f)
+
+
+def palette():
+    if curses.COLORS >= 256:
+        return {"text": 189, "dim": 245, "faint": 238, "mauve": 183, "blue": 111, "green": 150,
+                "yellow": 222, "red": 210, "surf": 60}
+    return {"text": curses.COLOR_WHITE, "dim": curses.COLOR_WHITE, "mauve": curses.COLOR_MAGENTA,
+            "blue": curses.COLOR_BLUE, "green": curses.COLOR_GREEN, "yellow": curses.COLOR_YELLOW,
+            "red": curses.COLOR_RED, "surf": curses.COLOR_BLUE}
+
+
+class App:
+    def __init__(self, scr):
+        self.scr = scr
+        self.C = palette()
+        self.COL = {"text": 1, "dim": 2, "mauve": 3, "blue": 4, "green": 5,
+                    "yellow": 6, "red": 7, "surf": 8, "faint": 9}
+        self.tabs = ["limits", "profiles", "metrics", "models", "knowledge", "journal", "pet"]
+        self.titles = {"limits": "ЛИМИТЫ", "profiles": "МАРШРУТЫ", "metrics": "МЕТРИКИ",
+                       "models": "МОДЕЛИ", "knowledge": "ЗНАНИЯ", "journal": "ЖУРНАЛ",
+                       "pet": "ПИТОМЕЦ"}
+        self.tab = "limits"
+        self.input, self.editing = "", False
+        self.answer = ["Поздоровайся с Mia — напиши вопрос и нажми Enter.",
+                       "Он ищет в своей базе: сначала по теме, потом по словам, и только потом — по смыслу."]
+        self.scroll, self.busy, self.status = 0, False, "готов"
+        self.limits, self.profiles, self.metrics, self.models = [], [], [], []
+        self.hot, self.cold, self.total, self.pet = [], 0, 0, {}
+        self.journal = []
+        self.last_heavy, self.frame, self.blink = 0.0, 0, False
+        self.pair_of = {}
+
+    # ------------------------------------------------------------------ вывод
+    def put_bar(self, y, x, pct, width, color):
+        """Полоса запаса: заливка цветом статуса, остаток тусклым. Раньше заливка и остаток
+        рисовались одним цветом — визуально получался «кирпич», наезжавший на цифры."""
+        pct = max(0, min(100, int(pct)))
+        f = int(width * pct / 100)
+        self.put(y, x, "█" * f, color)
+        self.put(y, x + f, "░" * (width - f), "faint")
+
+    def put(self, y, x, s, color="text", attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w or not s:
+            return
+        s = s[: max(0, w - x - 1)]
+        try:
+            self.scr.addstr(y, x, s, curses.color_pair(self.pair_of.get(color, 1)) | attr)
+        except curses.error:
+            pass
+
+    def hline(self, y, label="", color="surf"):
+        w = self.scr.getmaxyx()[1]
+        line = "─" * max(0, w - 2)
+        if label:
+            line = f"─┤ {label} ├" + line[max(0, len(label) + 6):]
+        self.put(y, 1, line, color)
+
+    def band(self, y, left, right="", color="bandaccent"):
+        """Полоса во всю ширину фоном (как шапка приложения): инверсия смотрелась грязно."""
+        w = self.scr.getmaxyx()[1]
+        self.put(y, 0, " " * (w - 1), color)
+        self.put(y, 2, left, color, curses.A_BOLD)
+        if right:
+            self.put(y, max(4, w - len(right) - 3), right, color)
+
+    def draw_header(self):
+        rows = [""] * 3
+        for ch in "MIA":
+            for i, part in enumerate(BIG.get(ch, ["   "])):
+                rows[i] += part + " "
+        for i, r in enumerate(rows):
+            self.put(i + 1, 2, r, "mauve", curses.A_BOLD)
+        ok = next((m for m in self.metrics if m["name"] == "llm.ok_rate"), None)
+        left = sum(r["left"] for r in self.limits)
+        cap = sum(r["lim"] for r in self.limits)
+        info = f"{datetime.now():%H:%M:%S}  запас квот {left}/{cap}"
+        if ok:
+            info += f"  ок-рейт {ok['value']:.0f}%"
+        if self.pet:
+            info += f"  лвл {self.pet['level']}"
+        self.put(2, max(4, self.scr.getmaxyx()[1] - len(info) - 3), info, "blue")
+        self.put(2, len(rows[1]) + 5, "терминальное рабочее место системы", "dim")
+        self.band(0, " MIA ", info, "mauve")
+        for i, name in enumerate(self.tabs):
+            mark = "▐" if name == self.tab else " "
+            col = "mauve" if name == self.tab else "dim"
+            self.put(5, 2 + i * 13, f"{mark}{i + 1} {self.titles[name]}", col,
+                     curses.A_BOLD if name == self.tab else 0)
+        self.hline(6, color="surf")
+
+    # ---- питомец
+    def draw_pet(self, y0, x0, width):
+        p = self.pet or {}
+        mood = p.get("mood", "idle")
+        if self.busy:
+            sprite = PET["work"]
+        elif self.blink and mood in ("idle", "happy"):
+            sprite = PET["blink"]
+        else:
+            sprite = PET.get(mood, PET["idle"])
+        col = {"sleep": "dim", "sick": "red", "happy": "green"}.get(mood, "mauve")
+        self.put(y0, x0, "ПИТОМЕЦ", "dim")
+        for i, ln in enumerate(sprite):
+            self.put(y0 + 2 + i, x0 + 1, ln, col, curses.A_BOLD)
+        y = y0 + 2 + len(sprite) + 1
+        self.put(y, x0, f"лвл {p.get('level', 1)}", "blue", curses.A_BOLD)
+        for k, (label, key, col) in enumerate([("опыт", "xp", "blue"), ("сыт", "food", "green"),
+                                               ("жив", "alive", "mauve"), ("бодр", "swift", "yellow")]):
+            yy = y + 2 + k
+            self.put(yy, x0, f"{label:<5}", "text", curses.A_BOLD)
+            self.put_bar(yy, x0 + 6, p.get(key, 0), 14, col)
+            self.put(yy, x0 + 22, f"{p.get(key, 0):>3}%", col, curses.A_BOLD)
+        self.put(y + 7, x0, f"отработано: {p.get('reqs',0)} · знание: {p.get('notes',0)}", "dim")
+        for j, b in enumerate(p.get("badges", [])[:5]):
+            self.put(y + 9 + j // 3, x0 + (j % 3) * 11, f"◆{b[:9]}", "blue")
+
+    # ---- вкладки
+    def draw_limits(self, y0, wmax):
+        self.put(y0, 2, f"{'источник':<11}{'осталось':>9}{'из':>7}{'сегодня':>9}   ", "dim")
+        self.put(y0, 39, "запас", "dim")
+        self.put(y0, 53, "процент", "dim")
+        for i, r in enumerate(self.limits[:16]):
+            col = "green" if r["pct"] >= 60 else "yellow" if r["pct"] >= 30 else "red"
+            self.put(y0 + 2 + i * 1, 2, f"{r['id']:<11}{r['left']:>9}{r['lim']:>7}{r['used']:>9}   ")
+            self.put_bar(y0 + 2 + i, 39, r["pct"], 10, col)
+            self.put(y0 + 2 + i, 51, f"{r['pct']:>3}%", col)
+            self.put(y0 + 2 + i, 57, f"rpm {r['rpm']}", "dim")
+        if not self.limits:
+            self.put(y0 + 1, 2, "роутер не отвечает: systemctl --user status llm-ladder", "red")
+        return y0 + 2 + min(len(self.limits), 14)
+
+    def draw_profiles(self, y0, wmax):
+        self.put(y0, 2, f"{'профиль':<10}{'стволов':>8}{'провайдеров':>13}{'в кулдауне':>12}{'отсеяно':>9}   замечание", "dim")
+        for i, p in enumerate(self.profiles):
+            note, col = "", "green"
+            if p.get("singleProviderRisk"):
+                note, col = f"⚠ один провайдер: {p['singleProviderRisk']}", "red"
+            elif (p.get("dominantShare") or 0) >= 0.6:
+                note, col = f"⚠ перекос {int(p['dominantShare']*100)}% на одном", "yellow"
+            self.put(y0 + 1 + i, 2, f"{p['profile']:<10}{p.get('alive',0):>8}{p.get('providers',0):>13}"
+                                    f"{p.get('cooling',0):>12}{p.get('capability',0):>9}")
+            self.put(y0 + 1 + i, 56, note, col)
+        return y0 + 3 + len(self.profiles)
+
+    def draw_metrics(self, y0, wmax):
+        self.put(y0, 2, f"{'метрика':<28}{'значение':>14} {'единица':<7} обновлено", "dim")
+        for i, m in enumerate(self.metrics[:16]):
+            v = m["value"]
+            self.put(y0 + 1 + i, 2, f"{m['name']:<28}{(f'{v:,.4g}' if v is not None else '—'):>14} "
+                                    f"{(m['unit'] or ''):<7} {str(m['last'])[:16]}")
+        return y0 + 3 + len(self.metrics[:16])
+
+    def draw_models(self, y0, wmax):
+        self.put(y0, 2, f"{'модель':<50}{'запусков':>9}{'ок':>5}{'пусто':>7}{'отказ':>7}{'мс':>8}", "dim")
+        for i, m in enumerate(self.models):
+            self.put(y0 + 1 + i, 2, f"{m['rung'][:48]:<50}{m['fires']:>9}{m['ok']:>5}"
+                                    f"{m['empty'] or 0:>7}{m['fails'] or 0:>7}{m['avg_ms'] or 0:>8}")
+        return y0 + 3 + len(self.models)
+
+    def draw_journal(self, y0, wmax):
+        self.put(y0, 2, f"{'когда':<18}{'профиль':<9}{'модель':<44}{'итог':<9}{'мс':>7}", "dim")
+        for i, ev in enumerate(self.journal):
+            col = {"ok": "green", "empty": "yellow", "fail": "red",
+                   "exhausted": "red", "loop_detected": "yellow"}.get(ev["status"], "text")
+            self.put(y0 + 1 + i, 2, f"{str(ev['ts'])[:16]:<18}{str(ev['profile'])[:8]:<9}"
+                                    f"{str(ev['rung'] or '—')[:42]:<44}{str(ev['status']):<9}"
+                                    f"{ev['ms'] or 0:>7}", col)
+        return y0 + 3 + len(self.journal)
+
+    def draw_knowledge(self, y0, wmax):
+        share = int(100 * self.cold / self.total) if self.total else 0
+        self.put(y0, 2, f"записей: {self.total}   не читали 30 дней: {self.cold} ({share}%)", "blue")
+        self.put(y0 + 2, 2, "чаще всего читали:", "dim")
+        for i, r in enumerate(self.hot):
+            self.put(y0 + 3 + i, 4, f"{r['reads']:>3}×  {(r['key'] or '—'):<26} {(r['title'] or '')[:44]}")
+        return y0 + 4 + len(self.hot)
+
+    def draw_pet_tab(self, y0, wmax):
+        p = self.pet
+        self.put(y0, 2, "Питомец отражает состояние системы настоящими цифрами — не украшение:", "dim")
+        rows = [
+            ("сыт", "запас бесплатных квот", p.get("food", 0), "yellow"),
+            ("жив", "доля успешных обращений (ок-рейт)", p.get("alive", 0), "green"),
+            ("бодр", "скорость ответов (обратная к p95)", p.get("swift", 0), "mauve"),
+            ("опыт", "100 запросов = уровень", p.get("xp", 0), "blue"),
+        ]
+        for i, (name, why, val, col) in enumerate(rows):
+            self.put(y0 + 2 + i, 2, f"{name:<6}{bar(val, 30)} {val:>3}%   {why}", col)
+        self.put(y0 + 7, 2, f"уровень {p.get('level',1)} · отработано {p.get('reqs',0)} запросов · "
+                            f"в базе {p.get('notes',0)} записей", "text")
+        self.put(y0 + 9, 2, "ачивки выдаются за реальные заслуги:", "dim")
+        for i, b in enumerate(p.get("badges", [])):
+            self.put(y0 + 10 + i, 4, f"◆ {b}", "blue")
+        return y0 + 11 + len(p.get("badges", []))
+
+    def draw_side(self, y0, x0, width):
+        """Вторая колонка: сводка, спрос на знание и живая лента — чтобы ширина экрана работала."""
+        m = {r["name"]: r for r in self.metrics}
+        self.put(y0, x0, "СВОДКА", "mauve", curses.A_BOLD)
+        rows = [("ок-рейт", "llm.ok_rate", "%"), ("p95", "llm.latency_p95", "мс"),
+                ("запросов", "llm.requests.total", ""), ("токенов вх", "llm.tokens_in", "")]
+        for i, (label, key, unit) in enumerate(rows):
+            v = m.get(key, {}).get("value")
+            txt = f"{v:,.0f}" if v is not None else "—"
+            col = "green" if key == "llm.ok_rate" and (v or 0) >= 75 else "text"
+            self.put(y0 + 2 + i, x0, f"{label:<11}{txt:>10} {unit}", col)
+        self.put(y0 + 7, x0, "─" * (width - 1), "faint")
+        self.put(y0 + 8, x0, "ЧАЩЕ ВСЕГО СПРАШИВАЮТ", "mauve", curses.A_BOLD)
+        for i, r in enumerate(self.hot[:4]):
+            self.put(y0 + 10 + i, x0, f"{r['reads']:>3}× {(r['key'] or '—')[:24]}", "blue")
+        self.put(y0 + 15, x0, "─" * (width - 1), "faint")
+        self.put(y0 + 16, x0, "ПОСЛЕДНИЕ СОБЫТИЯ", "mauve", curses.A_BOLD)
+        for i, ev in enumerate(self.journal[:8]):
+            col = {"ok": "green", "empty": "yellow", "fail": "red",
+                   "exhausted": "red", "loop_detected": "yellow"}.get(ev["status"], "dim")
+            model = str(ev["rung"] or "—").split("/")[-1][:18]
+            self.put(y0 + 18 + i, x0, f"{model:<19}{ev['status']:<7}{ev['ms'] or 0:>6}мс", col)
+
+    def draw_answer(self, y0, y1, wmax):
+        self.hline(y0, "ОТВЕТ СИСТЕМЫ", "surf")
+        avail = max(1, y1 - y0 - 1)
+        lines = self.answer
+        self.scroll = max(0, min(self.scroll, max(0, len(lines) - avail)))
+        for i, ln in enumerate(lines[self.scroll: self.scroll + avail]):
+            col = "green" if ln.startswith("[") else "dim" if ln.startswith("·") or ln.startswith("(") else "text"
+            self.put(y0 + 1 + i, 2, ln, col)
+
+    def draw_input(self, y):
+        w = self.scr.getmaxyx()[1]
+        self.put(y, 0, " " * (w - 1))
+        prompt = "mia ◂ " if not self.busy else "mia ▖ "
+        self.put(y, 1, prompt, "mauve", curses.A_BOLD)
+        if not self.editing and not self.input:
+            self.put(y, 1 + len(prompt), "напиши вопрос системе…", "dim")
+        else:
+            shown = self.input[-(w - len(prompt) - 4):]
+            self.put(y, 1 + len(prompt), shown)
+            if self.editing:
+                self.put(y, 1 + len(prompt) + len(shown), "█", "mauve")
+
+    def draw_footer(self):
+        h, w = self.scr.getmaxyx()
+        tip = TIPS[self.frame // 40 % len(TIPS)]
+        self.band(h - 1, f" ◆ {tip}"[: w - 30], "Ctrl+C выход ", "band")
+        self.put(h - 2, 1, f"● {self.status}   [Tab/F1-F6 вкладки · Ctrl+R обновить · Ctrl+C выход]"[: w - 2], "dim")
+
+    def draw(self):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        self.draw_header()
+        y0 = 8
+        # три колонки на широком экране: данные · сводка · питомец (раньше была дыра в центре)
+        pet_w = 40 if w >= 110 else 0
+        side_w = 34 if w >= 150 else 0
+        wmax = w - pet_w - side_w
+        drawer = {"limits": self.draw_limits, "profiles": self.draw_profiles, "metrics": self.draw_metrics,
+                  "models": self.draw_models, "knowledge": self.draw_knowledge,
+                  "journal": self.draw_journal, "pet": self.draw_pet_tab}[self.tab]
+        y_after = drawer(y0, wmax)
+        if side_w and self.tab != "pet":
+            self.draw_side(y0, w - pet_w - side_w + 2, side_w - 2)
+        if pet_w and self.tab != "pet":
+            self.draw_pet(y0, w - pet_w + 2, pet_w - 4)
+        answer_top = max(y_after + 1, h - 14)
+        self.draw_answer(answer_top, h - 3, w)
+        self.draw_input(h - 2)
+        self.draw_footer()
+
+    # ------------------------------------------------------------------ логика
+    def run_command(self, text):
+        t = text.strip()
+        if not t:
+            return
+        low = t.lower()
+        if low in (":q", ":quit", ":exit"):
+            raise SystemExit
+        if low == ":clear":
+            self.answer = ["очищено"]
+        elif low[1:] in ("limits", "profiles", "metrics", "models", "know", "knowledge", "journal", "pet"):
+            self.tab = {"know": "knowledge"}.get(low[1:], low[1:])
+            self.answer = [f"вкладка: {self.titles[self.tab]}"]
+        elif low in (":hot", ":cold"):
+            out = subprocess.run([DB_CLI, low[1:]], capture_output=True, text=True, timeout=30)
+            self.answer = (out.stdout or "").strip().splitlines() or ["пусто"]
+        elif low == ":badges":
+            self.answer = ["◆ " + b for b in self.pet.get("badges", [])]
+        else:
+            self.busy, self.status = True, f"ищу: {t[:44]}"
+            self.answer = ["· тема → слова → смысл…"]
+            self.draw()
+            self.answer = ask_system(t)
+            self.busy = False
+            self.status = "нашёл" if self.answer and not self.answer[0].startswith("ничего") else "не нашёл"
+        self.scroll = 0
+
+    def handle_key(self, ch):
+        if ch == -1:
+            return
+        if self.editing:
+            if ch in (10, 13, curses.KEY_ENTER):
+                self.editing = False
+                self.run_command(self.input)
+                self.input = ""
+            elif ch == 27:
+                self.editing, self.input = False, ""
+            elif ch == 3:
+                raise SystemExit
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.input = self.input[:-1]
+                if not self.input:
+                    self.editing = False
+            elif 32 <= ch < 0x110000:
+                self.input += chr(ch)
+            return
+        if ch in (3, 17):
+            raise SystemExit
+        if ch == 18:
+            self.refresh(heavy=True); self.status = "обновлено"
+        elif ch == 9:
+            self.tab = self.tabs[(self.tabs.index(self.tab) + 1) % len(self.tabs)]
+        elif curses.KEY_F1 <= ch <= curses.KEY_F7:
+            self.tab = self.tabs[ch - curses.KEY_F1]
+        elif ch == curses.KEY_UP:
+            self.scroll = max(0, self.scroll - 1)
+        elif ch == curses.KEY_DOWN:
+            self.scroll += 1
+        elif ch == curses.KEY_PPAGE:
+            self.scroll = max(0, self.scroll - 10)
+        elif ch == curses.KEY_NPAGE:
+            self.scroll += 10
+        elif ch in (10, 13, curses.KEY_ENTER, ord("/")):
+            self.editing, self.input = True, ""
+        elif 32 <= ch < 0x110000:
+            self.editing, self.input = True, chr(ch)
+
+    def refresh(self, heavy=False):
+        self.limits, self.usage = load_limits()
+        if heavy or time.time() - self.last_heavy > 20:
+            self.profiles = load_profiles()
+            self.metrics = load_metrics()
+            self.models = load_models()
+            self.hot, self.cold, self.total = load_knowledge()
+            self.pet = load_pet()
+            self.journal = load_journal()
+            self.last_heavy = time.time()
+
+    def loop(self):
+        curses.curs_set(0)
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        def clamp(c):
+            if isinstance(c, int) and 0 <= c < curses.COLORS:
+                return c
+            return curses.COLOR_WHITE
+
+        # ⚠️ раньше таблица пар не заполнялась: всё рисовалось одним цветом (pair 1).
+        for n, i in self.COL.items():
+            try:
+                curses.init_pair(i, clamp(self.C[n]), -1)
+            except curses.error:
+                try:
+                    curses.init_pair(i, clamp(self.C[n]) % 8, curses.COLOR_BLACK)
+                except curses.error:
+                    pass
+            self.pair_of[n] = i
+        if curses.COLORS >= 256:      # пары с фоном: шапка и подвал как у приложения, а не как лог
+            for j, (name, fg, bg) in enumerate([("band", self.C["text"], 236),
+                                                ("bandaccent", 234, self.C["mauve"]),
+                                                ("panel", self.C["text"], 235)], start=20):
+                try:
+                    curses.init_pair(j, clamp(fg), clamp(bg))
+                    self.pair_of[name] = j
+                except curses.error:
+                    self.pair_of[name] = self.COL["text"]
+        else:
+            self.pair_of["band"] = self.pair_of["bandaccent"] = self.pair_of["panel"] = self.COL["text"]
+        self.scr.nodelay(True)
+        self.refresh(heavy=True)
+        while True:
+            self.draw()
+            ch = self.scr.getch()
+            if ch != -1:
+                self.handle_key(ch)
+            self.frame += 1
+            self.blink = (self.frame % 14) in (0, 1)          # моргает ~раз в 3 секунды
+            if self.frame % 25 == 0:
+                self.refresh()
+            time.sleep(0.2)
+
+
+def main(scr):
+    App(scr).loop()
+
+
+if __name__ == "__main__":
+    try:
+        curses.wrapper(main)
+    except SystemExit:
+        pass
+    except KeyboardInterrupt:
+        pass

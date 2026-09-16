@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# mia-panel — терминальная панель системы: лимиты, глубина маршрутов, метрики стека, спрос на знание.
+# Открывается на рабочей области 10 (биндинг $mod+Shift+q). Имя берётся из базы (`db get brand:name`).
+U="${LADDER_URL:-http://127.0.0.1:8787}"
+DB=~/.local/bin/db
+G=$'\e[38;5;114m'; Y=$'\e[38;5;222m'; R=$'\e[38;5;210m'; D=$'\e[38;5;245m'; B=$'\e[1m'; N=$'\e[0m'
+
+NAME=$("$DB" sql "SELECT body FROM notes WHERE key='brand:name'" --json 2>/dev/null \
+       | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(d[0]["body"].strip().splitlines()[0] if d else "")
+except Exception: print("")' 2>/dev/null)
+NAME=${NAME:-Mia}
+
+bar() { # $1 = процент запаса
+    local pct=$1 filled empty out="" col
+    (( pct > 100 )) && pct=100; (( pct < 0 )) && pct=0
+    filled=$(( pct * 20 / 100 )); empty=$(( 20 - filled ))
+    if   (( pct >= 60 )); then col=$G; elif (( pct >= 30 )); then col=$Y; else col=$R; fi
+    for ((i=0;i<filled;i++)); do out+="█"; done
+    printf '%s%s%s%s' "$col" "$out" "$D" "$(printf '░%.0s' $(seq 1 $empty 2>/dev/null))$N"
+}
+
+tick=0
+while :; do
+    json=$(curl -s --max-time 3 "$U/usage" 2>/dev/null)
+    clear
+    printf '%s  %s%s  %s· терминальная панель%s   %s%s%s\n\n' \
+        "$B" "${NAME^^}" "$N" "$D" "$N" "$D" "$(date '+%H:%M:%S')" "$N"
+
+    printf '  %s── ЛИМИТЫ (только бесплатные источники) ──%s\n' "$D" "$N"
+    if [[ -z $json ]]; then
+        printf '  %sроутер не отвечает на %s%s\n' "$R" "$U" "$N"
+    else
+        printf '  %s%-11s %9s %7s %8s  %s  %-5s %s%s\n' "$D" "ИСТОЧНИК" "ОСТАЛОСЬ" "ИЗ" "СЕГОДНЯ" "ЗАПАС" "RPM" "ЗАМЕТКА" "$N"
+        while IFS=$'\t' read -r id left lim used pct rpm note; do
+            printf '  %-11s %9s %7s %8s  ' "$id" "$left" "$lim" "$used"
+            bar "$pct"
+            printf '  %-5s %s%s%s\n' "$rpm" "$D" "$note" "$N"
+        done < <(jq -r '
+          [ .providers[] | select(.tier == "free" and .key == true and (.limits.daily // 0) > 0 and (.enabledModels // 0) > 0)
+            | { id, left: (.remainingDaily // 0), lim: .limits.daily,
+                used: (.requestsToday // 0), pct: (100 * (.remainingDaily // 0) / .limits.daily | floor),
+                rpm: (.limits.rpm // "-"), note: (.note // "" | .[0:46]) } ]
+          | sort_by(.pct) | .[] | [.id, .left, .lim, .used, .pct, .rpm, .note] | @tsv' <<<"$json")
+        jq -r '[ .providers[] | select(.tier == "free" and .key == true and (.limits.daily // 0) > 0 and (.enabledModels // 0) > 0) ]
+               | (map(.remainingDaily // 0) | add) as $l | (map(.limits.daily) | add) as $m
+               | "  \u001b[1mИТОГО\u001b[0m       \($l) из \($m)"' <<<"$json"
+    fi
+
+    # тяжёлые разделы — раз в 30 с, чтобы не дёргать роутер и базу каждые 5 с
+    if (( tick % 6 == 0 )); then
+        heavy=$( {
+            printf '  %s── ПРОФИЛИ (сколько маршрутов живёт) ──%s\n' "$D" "$N"
+            "$DB" sql "SELECT 'profiles'" >/dev/null 2>&1
+            # просто печатаем доктора с отступом: раньше тут был awk, который падал на «⚠» и «:»
+            ~/.local/bin/ladder doctor 2>/dev/null | sed 's/^/  /' | head -8
+            printf '\n  %s── МЕТРИКИ СТЕКА ──%s\n' "$D" "$N"
+            "$DB" metric top 2>/dev/null | sed 's/^/  /' | head -7
+            printf '\n  %s── ЗНАНИЯ (спрос) ──%s\n' "$D" "$N"
+            "$DB" hot --days 30 --limit 3 2>/dev/null | sed -n '2,9p' | sed 's/^/  /'
+            printf '\n  %s── МОДЕЛИ (кто сколько отработал) ──%s\n' "$D" "$N"
+            "$DB" models --limit 4 2>/dev/null | head -6 | sed 's/^/  /'
+        } )
+    fi
+    printf '%s\n' "$heavy"
+
+    printf '\n  %sподсказки: db find "вопрос" · db models · db hot/cold · ladder doctor · db brief%s\n' "$D" "$N"
+    tick=$(( tick + 1 ))
+    sleep 5
+done

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ru" data-theme="mocha">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mia</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- ШАПКА: одна строка. Слева — что работает, справа — время и Мия. -->
+  <header class="bar">
+    <span class="logo">MIA</span>
+    <span class="vline"></span>
+    <span class="kv kv-profile"><span class="k">профиль</span><b id="h-profile">—</b></span>
+    <span class="kv kv-model"><span class="k">модель</span><b id="h-model">—</b></span>
+    <span class="kv kv-quota"><span class="k">квота</span><b id="h-quota" title="Осталось запросов / дневной лимит">—</b></span>
+    <span class="grow"></span>
+    <span class="kv"><span class="k">запросов</span><b id="h-reqs">—</b></span>
+    <button id="theme" class="ghost" type="button" title="светлая / тёмная тема">◐</button>
+    <span class="clock" id="clock">--:--:--</span>
+    <div class="mia-unit" title="Мия — агент Mia">
+      <span class="mia-badge" id="mia">
+        <canvas id="mia-mini" width="50" height="56"></canvas>
+        <button id="mia-mode-toggle" class="mia-mode-switch" title="Режим работы Мии">чат</button>
+      </span>
+      <div id="mia-bubbles" class="mia-bubbles">
+        <span class="mia-speech" id="mia-line">Я рядом и слежу за очередью.</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ЧАТ: главный блок. Лента переписки сверху, поле ввода приклеено снизу. -->
+  <main class="chat">
+    <div class="log" id="chat-log"></div>
+    <form class="composer" id="composer" autocomplete="off">
+      <span class="prompt">›</span>
+      <input id="q" type="text" placeholder="спроси Мию: «почему нельзя выключать турбо»" spellcheck="false">
+      <button id="ask" type="submit">Спросить</button>
+    </form>
+  </main>
+
+  <!-- НИЗ ЭКРАНА, ДВЕ ПОЛОВИНЫ: слева живой поток роутера, справа задачи Мии.
+       Задачи ставит только Мия (из чата) — кнопки создания здесь нет намеренно. -->
+  <div class="bottom">
+
+    <section class="flowwrap">
+      <div class="flowhead">
+        <span class="k">живой поток</span>
+        <span class="vline"></span>
+        <span class="k dim" id="flow-meta">—</span>
+        <span class="grow"></span>
+      </div>
+      <div class="tablewrap">
+        <table class="rows">
+          <thead>
+            <tr><th class="c-time">время</th><th class="c-prof">профиль</th><th class="c-step">шаг</th>
+                <th class="c-stat">статус</th><th class="c-ms">мс</th><th class="c-note">метка</th></tr>
+          </thead>
+          <tbody id="flow-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="taskswrap">
+      <div class="flowhead">
+        <span class="k">задачи</span>
+        <span class="vline"></span>
+        <button class="sw" id="sw-auto" type="button" title="АВТО: ставить задачу в очередь сразу, без кнопки старт">авто выкл</button>
+        <button class="sw" id="sw-mode" type="button" title="Режим доступа для задач: чтение / правка / полный">режим: правка</button>
+        <span class="grow"></span>
+        <span class="k dim" id="tasks-meta">—</span>
+      </div>
+      <div class="tablewrap">
+        <table class="rows tasks">
+          <thead>
+            <tr><th class="t-stat">статус</th><th class="t-title">задача</th><th class="t-model">модель</th>
+                <th class="t-time">идёт</th><th class="t-act"></th></tr>
+          </thead>
+          <tbody id="tasks-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

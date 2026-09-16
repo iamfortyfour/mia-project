@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# mia-launch — открыть Mia на 10-й рабочей области.
+#
+# ИДЕМПОТЕНТНОСТЬ (важно): повторный вызов не должен поднимать второе окно и вторую «10» область.
+# Поэтому: (1) одновременно выполняться может только один запуск (flock),
+#          (2) живой процесс/окно проверяются по PID-файлу и pgrep, а не только по дереву окон,
+#          (3) после старта ждём появления окна и фокусируем его,
+#          (4) пустые области-остатки (например «10:Nexus» после переименования) переименовываются
+#              в актуальную «10:<имя>» — иначе в баре висят две «10».
+#
+# Биндинги: $mod+n (Win+N) и $mod+Shift+q. Имя приложения берётся из базы (brand:name).
+set -u
+
+PID_FILE=/tmp/mia-web.pid
+LOCK_FILE=/tmp/mia-launch.lock
+
+# (1) только один запуск одновременно
+exec 9>"$LOCK_FILE" || exit 1
+if ! flock -n 9; then
+    exit 0                      # другой запуск уже идёт — он и откроет окно
+fi
+
+DB=~/.local/bin/db
+NAME=$("$DB" sql "SELECT body FROM notes WHERE key='brand:name'" --json 2>/dev/null \
+       | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin); print(d[0]["body"].strip().splitlines()[0] if d else "")
+except Exception: print("")' 2>/dev/null)
+NAME=${NAME:-Mia}
+WS="10:${NAME}"
+
+# (4) убрать области-остатки: всё, что «10:…» или прежнее имя, сводим к одной актуальной
+i3-msg -t get_workspaces 2>/dev/null | python3 -c '
+import json, sys
+ws = sys.argv[1]
+for w in json.load(sys.stdin):
+    name = w.get("name") or ""
+    if name == ws:
+        continue
+    if name.startswith("10:") or name == "10" or (name[:1].isdigit() and ":" in name and name.split(":", 1)[0] == "10"):
+        print(name)
+' "$WS" | while read -r old; do
+    i3-msg "rename workspace \"$old\" to \"$WS\"" >/dev/null 2>&1
+done
+
+# перейти на область и поднять окно, если оно уже есть
+focus() {
+    i3-msg "workspace \"$WS\"" >/dev/null 2>&1
+    i3-msg "[class=\"mia-web\"] focus" >/dev/null 2>&1
+}
+
+# (2) приложение уже работает?
+# PID-файл проверяем по факту: номер мог быть переиспользован другим процессом,
+# и тогда `kill -0` врал бы, что приложение живо (проверено — окно не поднималось).
+if [ -f "$PID_FILE" ]; then
+    APP_PID=$(cat "$PID_FILE" 2>/dev/null || echo "")
+    if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null && tr '\0' ' ' < "/proc/$APP_PID/cmdline" 2>/dev/null | grep -q 'mia-web'; then
+        focus
+        exit 0
+    fi
+    rm -f "$PID_FILE"        # номер не наш (или процесс мёртв) — файл недействителен
+fi
+# Живость проверяем у самого приложения (а не по pgrep: тот ловит чужие командные строки,
+# где встречается путь, и лаунчер решал, что окно уже открыто).
+if curl -s --max-time 2 "http://127.0.0.1:8790/api/identity" 2>/dev/null | grep -q '"app": *"mia-web"'; then
+    focus
+    exit 0
+fi
+
+# (3) запуск и ожидание окна (до 10 с), чтобы двойное нажатие не создало второй экземпляр
+focus
+setsid -f "$HOME/.local/bin/mia-web" >/tmp/mia-web.log 2>&1
+
+for _ in $(seq 1 40); do
+    sleep 0.25
+    if i3-msg -t get_tree 2>/dev/null | grep -q '"mia-web"'; then
+        focus
+        exit 0
+    fi
+    if ! curl -s --max-time 2 "http://127.0.0.1:8790/api/identity" 2>/dev/null | grep -q '"app": *"mia-web"'; then
+        break                    # приложение вышло само (например нашло уже запущенный экземпляр)
+    fi
+done
+exit 0

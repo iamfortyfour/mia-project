@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# nexus-world.sh — «отдельный мирок»: окно Nexus на рабочей области 10.
+# Запускает nexus-web (GTK3 + WebKit, свойственное окно), а не терминал:
+# приложение само создаёт окно класса nexus-web, поэтому kitty тут не нужен.
+# Вызывается биндингом $mod+Shift+q.
+set -u
+DB=~/.local/bin/db
+NAME=$("$DB" sql "SELECT body FROM notes WHERE key='brand:name'" --json 2>/dev/null \
+       | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    print(d[0]["body"].strip().splitlines()[0] if d else "")
+except Exception:
+    print("")' 2>/dev/null)
+NAME=${NAME:-Nexus}
+WS="10:${NAME}"
+TITLE="${NAME} · панель"
+
+# 1) переходим на область ПО НОМЕРУ С ИМЕНЕМ — как в ~/.config/i3/config ($ws10)
+i3-msg "workspace number ${WS}" >/dev/null 2>&1
+
+# 2) если окно уже открыто — поднять; иначе запустить приложение (оно своё окно сделает само)
+if i3-msg -t get_tree 2>/dev/null | grep -q '"nexus-web"'; then
+    i3-msg "[class=\"nexus-web\"] focus" >/dev/null 2>&1
+else
+    i3-msg "exec ${HOME}/.local/bin/nexus-web" >/dev/null 2>&1
+fi

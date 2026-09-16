@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""mia-task — очередь задач Мии: хранилище (SQLite) и CLI.
+
+Зачем: Мия ставит задачи (из чата), раннер их выполняет через `pi` на бесплатных
+моделях, а пользователь видит очередь в панели. Промпт задачи лежит ФАЙЛОМ
+(`tasks/T-0007.md`) — его видно, можно править и сравнивать; состояние, попытки
+и события — в базе (`tasks`, `task_events` в agentdb), потому что нужен атомарный
+захват задачи воркером и дешёвые запросы «что в работе».
+
+Режимы доступа (снимок на момент старта): read (только чтение) · edit (правка
+в разрешённых каталогах) · full (всё, кроме sudo).
+
+Файл настроек: `tasks/settings.json` → {"auto": false, "mode": "edit"}.
+  auto — брать ли новые задачи в работу сразу, без кнопки «старт».
+
+Использование:
+  mia-task init · add · ls · json · show · start · cancel · claim · event · finish · settings
+"""
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+AGENTDB = Path(os.environ.get("AGENTDB") or (HOME / "agentdb" / "agent.db"))
+DIR = HOME / "dev" / "mia-project" / "tasks"
+SETTINGS = DIR / "settings.json"
+MODES = ("read", "edit", "full")
+STATUSES = ("new", "queued", "running", "ok", "failed", "cancelled")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, title TEXT NOT NULL, brief TEXT NOT NULL,
+  prompt_path TEXT, status TEXT NOT NULL DEFAULT 'queued', mode TEXT NOT NULL DEFAULT 'edit',
+  model TEXT NOT NULL DEFAULT 'ladder/agent', priority INTEGER NOT NULL DEFAULT 3,
+  attempts INTEGER NOT NULL DEFAULT 0, started_at TEXT, ended_at TEXT, run_id INTEGER,
+  log_path TEXT, result TEXT, error TEXT, artifacts TEXT, parent_id INTEGER, source TEXT);
+CREATE TABLE IF NOT EXISTS task_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER NOT NULL, ts TEXT NOT NULL,
+  kind TEXT NOT NULL, detail TEXT);
+CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
+CREATE INDEX IF NOT EXISTS task_events_task_idx ON task_events(task_id);
+"""
+
+
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def connect() -> sqlite3.Connection:
+    DIR.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(AGENTDB, timeout=5)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def need_tables(con: sqlite3.Connection) -> None:
+    row = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'").fetchone()
+    if not row:
+        sys.exit("таблиц ещё нет — выполни: mia-task init")
+
+
+def tid(value) -> int:
+    """Принимает 7, T-7, T-0007 → 7."""
+    s = str(value).strip().upper()
+    if s.startswith("T-"):
+        s = s[2:]
+    s = s.lstrip("0") or "0"
+    if not s.isdigit():
+        sys.exit(f"не понимаю номер задачи: {value}")
+    return int(s)
+
+
+def label(i: int) -> str:
+    return f"T-{int(i):04d}"
+
+
+def event(con, task_id: int, kind: str, detail: str = "") -> None:
+    con.execute("INSERT INTO task_events (task_id, ts, kind, detail) VALUES (?,?,?,?)",
+                (task_id, now(), kind, detail or ""))
+
+
+def load_settings() -> dict:
+    s = {"auto": False, "mode": "edit"}
+    try:
+        s.update(json.loads(SETTINGS.read_text()))
+    except Exception:
+        pass
+    return s
+
+
+def save_settings(s: dict) -> None:
+    DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS.write_text(json.dumps(s, ensure_ascii=False, indent=2) + "\n")
+
+
+# ------------------------------------------------------------------ команды
+
+def cmd_init(args) -> None:
+    con = connect()
+    con.executescript(SCHEMA)
+    con.commit()
+    if not SETTINGS.exists():
+        save_settings({"auto": False, "mode": "edit"})
+    print(f"готово: таблицы в {AGENTDB}, настройки в {SETTINGS}")
+
+
+def cmd_add(args) -> None:
+    brief = sys.stdin.read() if args.brief_file == "-" else Path(args.brief_file).expanduser().read_text()
+    mode = args.mode or load_settings()["mode"]
+    con = connect()
+    need_tables(con)
+    auto = load_settings().get("auto", False)          # АВТО: сразу в очередь, иначе ждём старта
+    status = "queued" if auto else "new"
+    cur = con.execute(
+        "INSERT INTO tasks (ts, title, brief, status, mode, model, priority, source) VALUES (?,?,?,?,?,?,?,?)",
+        (now(), args.title, brief, status, mode, args.model, args.priority, args.source))
+    task_id = cur.lastrowid
+    path = DIR / f"{label(task_id)}.md"
+    path.write_text(
+        f"---\n"
+        f"id: {label(task_id)}\ntitle: {args.title}\nmode: {mode}\nmodel: {args.model}\n"
+        f"priority: {args.priority}\nsource: {args.source}\ncreated: {now()}\n---\n\n{brief}\n")
+    con.execute("UPDATE tasks SET prompt_path=? WHERE id=?", (str(path), task_id))
+    event(con, task_id, "created", f"{args.source}: {args.title}")
+    con.commit()
+    state = load_settings()
+    tail = " · АВТО включено, раннер подхватит" if state.get("auto") else " · ждёт старта: mia-task start {label}"
+    print(f"{label(task_id)}{tail.format(label=label(task_id))}\nпромпт: {path}")
+
+
+def _rows(con, status=None, limit=20) -> list:
+    q = "SELECT * FROM tasks"
+    p = []
+    if status:
+        q += " WHERE status=?"
+        p.append(status)
+    q += " ORDER BY id DESC LIMIT ?"
+    p.append(limit)
+    return con.execute(q, p).fetchall()
+
+
+def cmd_ls(args) -> None:
+    con = connect()
+    need_tables(con)
+    rows = _rows(con, args.status, args.limit)
+    if not rows:
+        print("задач нет")
+        return
+    print(f"  {'номер':<8}{'статус':<11}{'режим':<7}{'модель':<13}{'поп':<5}название")
+    for r in rows:
+        dur = ""
+        if r["started_at"] and r["ended_at"]:
+            dur = f" ({r['started_at'][11:]}–{r['ended_at'][11:]})"
+        print(f"  {label(r['id']):<8}{r['status']:<11}{r['mode']:<7}{(r['model'] or '')[:12]:<13}{r['attempts']:<5}{r['title']}{dur}")
+
+
+def cmd_json(args) -> None:
+    con = connect()
+    need_tables(con)
+    out = []
+    for r in _rows(con, args.status, args.limit):
+        d = dict(r)
+        d["n"] = label(r["id"])
+        ev = con.execute("SELECT ts, kind, detail FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                         (r["id"],)).fetchone()
+        d["last_event"] = dict(ev) if ev else None
+        out.append(d)
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+def cmd_show(args) -> None:
+    con = connect()
+    need_tables(con)
+    i = tid(args.id)
+    r = con.execute("SELECT * FROM tasks WHERE id=?", (i,)).fetchone()
+    if not r:
+        sys.exit(f"{label(i)} не найдена")
+    print(f"{label(r['id'])} · {r['status']} · режим {r['mode']} · модель {r['model']} · попыток {r['attempts']}")
+    print(f"создана {r['ts']} · начата {r['started_at'] or '—'} · закончена {r['ended_at'] or '—'}")
+    if r["error"]:
+        print(f"ошибка: {r['error']}")
+    if r["result"]:
+        print(f"результат: {r['result']}")
+    if r["log_path"]:
+        print(f"лог: {r['log_path']}")
+        try:
+            tail = Path(r["log_path"]).read_text(errors="replace").splitlines()[-8:]
+            print("  " + "\n  ".join(tail))
+        except Exception:
+            pass
+    print(f"\n--- промпт ({r['prompt_path'] or '—'}) ---\n{r['brief']}")
+    print("\n--- события ---")
+    for e in con.execute("SELECT ts, kind, detail FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 20", (i,)):
+        print(f"  {e['ts'][11:]}  {e['kind']:<12} {e['detail'] or ''}")
+
+
+def cmd_start(args) -> None:
+    con = connect()
+    need_tables(con)
+    i = tid(args.id)
+    r = con.execute("SELECT status FROM tasks WHERE id=?", (i,)).fetchone()
+    if not r:
+        sys.exit(f"{label(i)} не найдена")
+    if r["status"] == "running":
+        sys.exit(f"{label(i)} уже выполняется")
+    con.execute("UPDATE tasks SET status='queued', started_at=NULL, ended_at=NULL WHERE id=?", (i,))
+    event(con, i, "start-requested", "ждёт раннера")
+    con.commit()
+    print(f"{label(i)}: поставлена в очередь — раннер подхватит")
+
+
+def cmd_cancel(args) -> None:
+    con = connect()
+    need_tables(con)
+    i = tid(args.id)
+    con.execute("UPDATE tasks SET status='cancelled', ended_at=? WHERE id=? AND status IN ('queued','running')",
+                (now(), i))
+    event(con, i, "cancelled", args.reason or "")
+    con.commit()
+    print(f"{label(i)}: отменена")
+
+
+def cmd_claim(args) -> None:
+    """Атомарно забрать задачу в работу. Код возврата: 0 — забрали, 1 — уже занята."""
+    con = connect()
+    need_tables(con)
+    i = tid(args.id)
+    s = load_settings()
+    mode = args.mode or s["mode"]
+    model = args.model or "ladder/agent"
+    cur = con.execute(
+        "UPDATE tasks SET status='running', started_at=?, attempts=attempts+1, mode=?, model=?, log_path=? "
+        "WHERE id=? AND status='queued'", (now(), mode, model, args.log, i))
+    got = cur.rowcount == 1
+    if got:
+        event(con, i, "claimed", f"режим {mode}, модель {model}")
+    con.commit()
+    print(f"{label(i)}: {'взята в работу' if got else 'уже занята или не в очереди'}")
+    sys.exit(0 if got else 1)
+
+
+def cmd_event(args) -> None:
+    con = connect()
+    need_tables(con)
+    i = tid(args.id)
+    event(con, i, args.kind, args.detail or "")
+    con.commit()
+    print(f"{label(i)}: событие {args.kind} записано")
+
+
+def cmd_finish(args) -> None:
+    con = connect()
+    need_tables(con)
+    i = tid(args.id)
+    if args.status not in STATUSES:
+        sys.exit(f"статус должен быть одним из: {', '.join(STATUSES)}")
+    con.execute("""UPDATE tasks SET status=?, ended_at=?, result=COALESCE(?, result),
+                   error=COALESCE(?, error), artifacts=COALESCE(?, artifacts), run_id=COALESCE(?, run_id)
+                   WHERE id=?""",
+                (args.status, now(), args.result, args.error, args.artifacts, args.run_id, i))
+    event(con, i, f"finished:{args.status}", (args.result or args.error or "")[:200])
+    con.commit()
+    print(f"{label(i)}: {args.status}")
+
+
+def cmd_settings(args) -> None:
+    s = load_settings()
+    if args.auto is not None:
+        s["auto"] = args.auto == "on"
+    if args.mode:
+        if args.mode not in MODES:
+            sys.exit(f"режим должен быть одним из: {', '.join(MODES)}")
+        s["mode"] = args.mode
+    if args.auto is not None or args.mode:
+        save_settings(s)
+    print(f"авто: {'вкл' if s['auto'] else 'выкл'} · режим доступа: {s['mode']}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="mia-task", description="очередь задач Мии")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="создать таблицы").set_defaults(fn=cmd_init)
+
+    a = sub.add_parser("add", help="создать задачу")
+    a.add_argument("--title", required=True)
+    a.add_argument("--brief-file", required=True)
+    a.add_argument("--mode", choices=MODES)
+    a.add_argument("--model", default="ladder/agent")
+    a.add_argument("--priority", type=int, default=3)
+    a.add_argument("--source", default="cli")
+    a.set_defaults(fn=cmd_add)
+
+    for name, fn in (("ls", cmd_ls), ("json", cmd_json)):
+        s = sub.add_parser(name, help="список задач")
+        s.add_argument("--status", choices=STATUSES)
+        s.add_argument("--limit", type=int, default=20)
+        s.set_defaults(fn=fn)
+
+    sh = sub.add_parser("show", help="показать задачу"); sh.add_argument("id"); sh.set_defaults(fn=cmd_show)
+    st = sub.add_parser("start", help="поставить в очередь"); st.add_argument("id"); st.set_defaults(fn=cmd_start)
+    c = sub.add_parser("cancel", help="отменить"); c.add_argument("id"); c.add_argument("--reason"); c.set_defaults(fn=cmd_cancel)
+    cl = sub.add_parser("claim", help="атомарно взять в работу")
+    cl.add_argument("id"); cl.add_argument("--mode", choices=MODES); cl.add_argument("--model"); cl.add_argument("--log")
+    cl.set_defaults(fn=cmd_claim)
+    ev = sub.add_parser("event", help="записать событие")
+    ev.add_argument("id"); ev.add_argument("--kind", required=True); ev.add_argument("--detail")
+    ev.set_defaults(fn=cmd_event)
+    f = sub.add_parser("finish", help="завершить задачу")
+    f.add_argument("id"); f.add_argument("--status", required=True); f.add_argument("--result")
+    f.add_argument("--error"); f.add_argument("--artifacts"); f.add_argument("--run-id", type=int)
+    f.set_defaults(fn=cmd_finish)
+    se = sub.add_parser("settings", help="настройки: авто и режим доступа")
+    se.add_argument("--auto", choices=("on", "off")); se.add_argument("--mode", choices=MODES)
+    se.set_defaults(fn=cmd_settings)
+
+    args = ap.parse_args()
+    args.fn(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

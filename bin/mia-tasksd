@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# mia-tasksd — один цикл раннера задач Мии: взять задачу из очереди → выполнить через pi → закрыть.
+#
+# Один цикл = одна задача: так его можно запускать и вручную, и таймером, и он не «виснет» на длинной
+# очереди. Всё, что делает задача, выполняет ОТДЕЛЬНЫЙ процесс pi на бесплатной модели, указанной в задаче.
+#
+# Состояния: new (ждёт старта) → queued (готова, раннер подхватит) → running → ok|failed|cancelled.
+#   Свитч «Авто» (tasks/settings.json) решает, попадёт ли новая задача сразу в queued или будет ждать
+#   `mia-task start`.
+set -u
+
+DIR="$HOME/dev/mia-project"
+CLI="$DIR/bin/mia-task"
+SETTINGS="$DIR/tasks/settings.json"
+LOGDIR="$HOME/.cache/mia-tasks"
+SESSDIR="$LOGDIR/sessions"
+MAX="${MIA_TASK_TIMEOUT:-600}"          # жёсткий предел на одну задачу, секунды
+mkdir -p "$LOGDIR" "$SESSDIR"
+
+# --- режим по умолчанию из настроек (auto читает сам mia-task при добавлении задачи)
+defmode="edit"
+if [ -f "$SETTINGS" ]; then
+    defmode=$(python3 -c "import json;print(json.load(open('$SETTINGS')).get('mode','edit'))" 2>/dev/null || echo edit)
+fi
+
+# --- самая старая задача, готовая к запуску
+id=$("$CLI" ls --status queued --limit 20 2>/dev/null | awk 'NR>1{print $1; exit}')
+if [ -z "$id" ]; then
+    echo "очередь пуста"
+    exit 0
+fi
+log="$LOGDIR/$id.log"
+
+# --- поля задачи из базы (модель, режим, путь к промпту)
+meta=$("$CLI" json --status queued --limit 20 2>/dev/null | python3 -c "
+import json,sys
+rows = json.load(sys.stdin)
+r = next((x for x in rows if x.get('n') == '$id'), None) or {}
+print(json.dumps({'model': r.get('model') or 'ladder/agent',
+                  'mode': r.get('mode') or '$defmode',
+                  'path': r.get('prompt_path') or ''}))
+" 2>/dev/null)
+[ -n "$meta" ] || { echo "$id: не смог прочитать задачу"; exit 0; }
+model=$(printf '%s' "$meta" | python3 -c "import json,sys;print(json.load(sys.stdin)['model'])" 2>/dev/null || echo ladder/agent)
+mode=$(printf '%s' "$meta" | python3 -c "import json,sys;print(json.load(sys.stdin)['mode'])" 2>/dev/null || echo "$defmode")
+ppath=$(printf '%s' "$meta" | python3 -c "import json,sys;print(json.load(sys.stdin)['path'])" 2>/dev/null || echo "")
+[ -f "${ppath:-/nonexistent}" ] || ppath="$DIR/tasks/$id.md"
+[ -f "$ppath" ] || { "$CLI" finish "$id" --status failed --error "нет файла промпта $ppath" >/dev/null; echo "$id: failed (нет промпта)"; exit 0; }
+
+# --- атомарный захват: если задачу забрали (или она не в очереди) — выходим
+if ! "$CLI" claim "$id" --mode "$mode" --model "$model" --log "$log" >/dev/null 2>&1; then
+    echo "$id: уже занята"
+    exit 0
+fi
+"$CLI" event "$id" --kind started --detail "модель $model, режим $mode" >/dev/null 2>&1
+
+# --- промпт: правила режима сверху, затем текст задачи
+prompt="$log.prompt"
+{
+    echo "РЕЖИМ ДОСТУПА: $mode."
+    case "$mode" in
+        read) echo "Только чтение: ничего не менять в системе — никаких записей, удалений и коммитов." ;;
+        edit) echo "Можно менять файлы в разрешённых каталогах и запускать команды. sudo запрещён." ;;
+        full) echo "Можно всё, кроме sudo (пароль вводит только пользователь)." ;;
+    esac
+    echo "Работай коротко и по делу. В конце приведи доказательства: вывод команд, пути файлов, JSON."
+    echo "Если чего-то не знаешь — скажи прямо, не выдумывай пути и цифры."
+    echo
+    cat "$ppath"
+} > "$prompt"
+
+# --- выполнение
+if ! command -v pi >/dev/null 2>&1; then
+    "$CLI" finish "$id" --status failed --error "pi не найден в PATH" >/dev/null 2>&1
+    echo "$id: failed (pi не найден)"
+    exit 0
+fi
+
+t0=$(date +%s)
+timeout "$MAX" pi -p --no-session --session-dir "$SESSDIR" --model "$model" "$(cat "$prompt")" >"$log" 2>&1
+rc=$?
+dt=$(( $(date +%s) - t0 ))
+
+if [ "$rc" -eq 0 ]; then
+    "$CLI" finish "$id" --status ok --result "выполнено за ${dt}s, лог $log" >/dev/null 2>&1
+    "$CLI" event "$id" --kind done --detail "${dt}s" >/dev/null 2>&1
+    echo "$id: ok (${dt}s, лог $log)"
+else
+    "$CLI" finish "$id" --status failed --error "код $rc за ${dt}s, лог $log" >/dev/null 2>&1
+    "$CLI" event "$id" --kind failed --detail "код $rc" >/dev/null 2>&1
+    echo "$id: failed (код $rc, ${dt}s, лог $log)"
+fi
+exit 0

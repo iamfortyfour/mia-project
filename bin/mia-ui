@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# mia-ui — отправить команду в окно Mia и получить результат (тесты интерфейса «как пользователь»).
+#   mia-ui "document.getElementById('q').value"          — выполнить и напечатать результат
+#   mia-ui --raw "..."                                   — то же, без ожидания (не ждать ответ)
+set -u
+DIR=/tmp/mia-ui
+mkdir -p "$DIR"
+wait_for() {  # $1 = id: ждём строку результата в журнале (файл-маркер больше не создаётся)
+    for _ in $(seq 1 160); do
+        out=$(python3 - "$DIR/results.jsonl" "$1" <<'PYRES'
+import json, sys
+path, cid = sys.argv[1], sys.argv[2]
+last = None
+try:
+    for line in open(path, encoding="utf-8"):
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("id") == cid:
+            last = d
+except FileNotFoundError:
+    pass
+if last:
+    print(("ok   " if last.get("ok") else "ОШИБКА ") + str(last.get("value", "")))
+PYRES
+)
+        if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+        sleep 0.25
+    done
+    echo "таймаут: окно не ответило (страница открыта и жива?)"
+    return 1
+}
+
+if [ "${1:-}" = "--raw" ]; then shift; fi
+ID="cmd-$(date +%s%N)"
+python3 - "$ID" "$*" <<'PY'
+import json, sys, pathlib
+cid, js = sys.argv[1], sys.argv[2]
+pathlib.Path("/tmp/mia-ui").mkdir(exist_ok=True)
+pathlib.Path(f"/tmp/mia-ui/{cid}.json").write_text(json.dumps({"js": js}, ensure_ascii=False))
+import sys as _s; print(cid, file=_s.stderr)
+PY
+[ "${1:-}" = "--raw" ] && exit 0
+wait_for "$ID"

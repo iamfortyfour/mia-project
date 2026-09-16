@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""
+mia-web — интерфейс Mia: локальный HTML/CSS/JS в нативном окне WebKit.
+
+Устройство:
+  • HTTP-сервер ТОЛЬКО на 127.0.0.1: статика из ~/dev/mia-project/web + JSON-API.
+    Данные настоящие: роутер (127.0.0.1:8787), база (~/agentdb/agent.db), поиск через `db find`.
+  • окно GTK3 + WebKit2 на этот сервер.
+
+API:
+  /api/live            лимиты, журнал, питомец              (5 с)
+  /api/heavy           профили, метрики, модели, знания     (30 с)
+  /api/flows?limit=N   запросы, сгруппированные по rid — для «потока» как в n8n
+  /api/stream          SSE-прокси живых событий роутера (/events)
+  POST /api/ask        поиск в базе знаний
+  /api/jslog           ошибки JS страницы → stderr
+"""
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import socket
+import sqlite3
+import time
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from datetime import datetime
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+WEB_DIR = os.path.expanduser("~/dev/mia-project/web")
+DB_PATH = os.path.expanduser(os.environ.get("AGENTDB") or "~/agentdb/agent.db")
+DB_CLI = os.path.expanduser("~/.local/bin/db")
+ROUTER = os.environ.get("LADDER_URL", "http://127.0.0.1:8787")
+UA = {"User-Agent": "mia-web/1.0"}
+STARTED_AT = time.monotonic()
+
+
+# --------------------------------------------------------------------- данные
+def router_json(path: str, timeout: float = 4.0):
+    try:
+        req = urllib.request.Request(ROUTER + path, headers=UA)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except Exception as e:
+        return {"_error": str(e)}
+
+
+def sql(q: str, params=()):
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=3)
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute(q, params)]
+        con.close()
+        return rows
+    except Exception as e:
+        return [{"_error": str(e)}]
+
+
+def limits_rows(usage: dict):
+    rows = []
+    if not isinstance(usage, dict) or "_error" in usage:
+        return rows
+    for p in usage.get("providers", []):
+        d = (p.get("limits") or {}).get("daily") or 0
+        if p.get("tier") != "free" or not p.get("key") or not d or not p.get("enabledModels"):
+            continue
+        left = p.get("remainingDaily") or 0
+        rows.append({"id": p["id"], "left": left, "lim": d, "used": p.get("requestsToday") or 0,
+                     "pct": int(100 * left / d) if d else 0,
+                     "rpm": (p.get("limits") or {}).get("rpm") or "-",
+                     "note": (p.get("note") or "")[:90]})
+    rows.sort(key=lambda r: r["pct"])
+    return rows
+
+
+def metrics_rows():
+    """Последнее значение + короткая история (для спарклайнов)."""
+    rows = sql("""SELECT name, value, unit, max(ts) AS last FROM metrics GROUP BY name ORDER BY name""")
+    hist = {}
+    for r in sql("""SELECT name, value FROM metrics WHERE ts >= datetime('now','-30 day') ORDER BY ts"""):
+        hist.setdefault(r["name"], []).append(r["value"])
+    for r in rows:
+        r["series"] = hist.get(r["name"], [])[-24:]
+    return rows
+
+
+def models_rows():
+    return sql("""SELECT rung, count(*) AS fires, sum(status='ok') AS ok, sum(status='empty') AS empty,
+                         sum(status IN ('fail','exhausted')) AS fails,
+                         round(avg(CASE WHEN ms IS NOT NULL THEN ms END)) AS avg_ms
+                  FROM outcomes WHERE rung IS NOT NULL GROUP BY rung ORDER BY fires DESC LIMIT 14""")
+
+
+def journal_rows():
+    return sql("""SELECT ts, rid, profile, rung, status, attempt, ms, needed, squeezed, waited_sec
+                  FROM outcomes ORDER BY ts DESC LIMIT 18""")
+
+
+def knowledge():
+    hot = sql("""SELECT n.key, n.title, count(*) AS reads FROM note_access a
+                 LEFT JOIN notes n ON n.id = a.note_id
+                 WHERE a.ts >= datetime('now','-30 day') GROUP BY a.note_id
+                 ORDER BY reads DESC LIMIT 6""")
+    cold = sql("""SELECT count(*) AS n FROM notes n WHERE n.status='active'
+                  AND NOT EXISTS (SELECT 1 FROM note_access a WHERE a.note_id = n.id
+                                  AND a.ts >= datetime('now','-30 day'))""")
+    total = sql("SELECT count(*) AS n FROM notes WHERE status='active'")
+    todo = sql("SELECT key, title, importance FROM notes WHERE status='todo' ORDER BY importance DESC LIMIT 5")
+    return {"hot": hot, "cold": (cold[0].get("n", 0) if cold else 0),
+            "total": (total[0].get("n", 0) if total else 0), "todo": todo}
+
+
+def flows(limit: int = 12):
+    """Запросы, сгруппированные по rid: из этого фронтенд рисует путь запроса.
+
+    ⚠️ rid — счётчик внутри процесса роутера и сбрасывается при его перезапуске.
+    Поэтому группируем по rid только внутри выборки самых свежих записей (по max(ts)).
+    """
+    rows = sql("""SELECT rid, ts, profile, rung, provider, status, attempt, ms, needed,
+                         escalated, squeezed, tokens_before, tokens_after,
+                         waited_sec, waited_for, tokens_in, tokens_out
+                  FROM outcomes WHERE rid IS NOT NULL
+                  ORDER BY ts DESC LIMIT 400""")
+    if not rows or (rows and "_error" in rows[0]):
+        return {"flows": []}
+    order, meta = [], {}
+    for r in rows:
+        rid = r["rid"]
+        if rid not in meta:
+            if len(order) >= limit:
+                continue
+            order.append(rid)
+            meta[rid] = {"rid": rid, "ts": r["ts"], "profile": r["profile"], "status": r["status"],
+                         "needed": r["needed"], "steps": [], "squeezed": None, "waited": None,
+                         "tokens": {"in": 0, "out": 0}}
+        f = meta[rid]
+        f["ts"] = max(f["ts"] or 0, r["ts"] or 0)
+        f["status"] = r["status"] or f["status"]
+        if r.get("squeezed") and r.get("tokens_before"):
+            f["squeezed"] = {"before": r["tokens_before"], "after": r["tokens_after"]}
+        if r.get("waited_sec"):
+            f["waited"] = {"sec": round(float(r["waited_sec"]), 1), "rung": r.get("waited_for")}
+        if r.get("tokens_in"):
+            f["tokens"]["in"] += r["tokens_in"] or 0
+            f["tokens"]["out"] += r["tokens_out"] or 0
+        # в журнале бывают шаги без модели: это не попытка ствола, а событие лестницы
+        # (исчерпали всё / поймали зацикливание). Дáём им человеческое имя, иначе UI спотыкается о null.
+        label = {"exhausted": "лестница исчерпана", "loop_detected": "обнаружено зацикливание",
+                 "nudge": "подсказка модели", "compacted": "сжатие контекста"}.get(r["status"])
+        f["steps"].append({"rung": r["rung"] or label or "(без модели)",
+                           "provider": r["provider"], "status": r["status"],
+                           "ms": r["ms"], "escalated": bool(r["escalated"]), "attempt": r["attempt"],
+                           "ts": r["ts"], "synthetic": r["rung"] is None})
+    out = []
+    for i, rid in enumerate(order):
+        f = meta[rid]
+        # порядок — по времени журнала: событие «лестница исчерпана» пишется ПОСЛЕ попыток,
+        # и сортировка по номеру попытки ставила его первым (проверено на живых данных)
+        f["steps"].sort(key=lambda s: (s["ts"] or 0, s["attempt"] or 0))
+        for n, s in enumerate(f["steps"], 1):
+            s["n"] = n
+        f["attempts"] = len(f["steps"])
+        f["at"] = datetime.fromtimestamp((f["ts"] or 0) / 1000).strftime("%H:%M:%S") if f["ts"] else "—"
+        if not f["tokens"]["in"]:
+            f["tokens"] = None
+        out.append(f)
+    return {"flows": out}
+
+
+def web_version() -> str:
+    """Отпечаток статики: страница опрашивает его раз в секунду и сама перезагружается
+    при изменении файлов — удобно смотреть правки в реальном времени."""
+    try:
+        parts = []
+        for name in sorted(os.listdir(WEB_DIR)):
+            if name.endswith((".html", ".css", ".js")):
+                st = os.stat(os.path.join(WEB_DIR, name))
+                parts.append(f"{name}:{int(st.st_mtime)}:{st.st_size}")
+        return hashlib.sha1("|".join(parts).encode()).hexdigest()[:12]
+    except Exception:
+        return "0"
+
+
+
+def mia_name() -> str:
+    try:
+        rows = sql("SELECT body FROM notes WHERE key='brand:agent'")
+        if rows and rows[0].get("body"):
+            return rows[0]["body"].strip().splitlines()[0][:24] or "Мия"
+    except Exception:
+        pass
+    return "Мия"
+
+
+def router_health():
+    started = time.perf_counter()
+    try:
+        req = urllib.request.Request(ROUTER + "/usage", headers=UA)
+        with urllib.request.urlopen(req, timeout=3) as r:
+            json.load(r)
+        return {"ok": True, "ms": int((time.perf_counter() - started) * 1000)}
+    except Exception as e:
+        return {"ok": False, "ms": None, "error": str(e)}
+
+
+def journal_age_sec():
+    journal = os.path.expanduser("~/.cache/llm-ladder/outcomes.jsonl")
+    now_ms = time.time() * 1000
+    last = 0
+    try:
+        with open(journal, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 400000))
+            tail = f.read().decode("utf-8", "replace")
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ts = json.loads(line).get("ts") or 0
+            except Exception:
+                continue
+            if ts > last:
+                last = ts
+    except Exception:
+        return None
+    return max(0, int((now_ms - last) / 1000)) if last else None
+
+
+def task_counts():
+    try:
+        con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=3)
+        queued, running = con.execute("""SELECT
+            COALESCE(SUM(status='queued'), 0), COALESCE(SUM(status='running'), 0)
+            FROM tasks""").fetchone()
+        con.close()
+        return {"queued": int(queued or 0), "running": int(running or 0)}
+    except Exception:
+        return {"queued": 0, "running": 0}
+
+
+def mia_feed():
+    """Кормление Мии — по ЖИВОМУ журналу исходов (JSONL), а не по зеркалу в базе.
+
+    Раньше читалась таблица outcomes в agentdb, а она пополняется ночным импортом: утром Мия
+    «спала» посреди работы, показывая часы простоя (проверено: зеркало 19:36 против журнала 20:55).
+    Журнал — источник правды для событий; база остаётся для аналитики.
+    """
+    journal = os.path.expanduser("~/.cache/llm-ladder/outcomes.jsonl")
+    now_ms = datetime.now().timestamp() * 1000
+    hour_ago = now_ms - 3600000
+    fed, last = 0, 0
+    try:
+        with open(journal, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 400000))              # хвоста в 400 КБ хватает на час работы
+            tail = f.read().decode("utf-8", "replace")
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue                                # первая строка может быть обрезана
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            ts = e.get("ts") or 0
+            if ts > last:
+                last = ts
+            if ts >= hour_ago and e.get("status") == "ok":
+                fed += 1
+    except Exception:
+        pass
+    mins = max(0.0, (now_ms - last) / 60000) if last else 999
+    hunger = int(max(0, min(100, mins / 3)))
+    return fed, hunger, int(mins)
+
+
+def pet_state(usage, metrics):
+    m = {r["name"]: r["value"] for r in metrics if isinstance(r.get("value"), (int, float))}
+    rows = limits_rows(usage)
+    left = sum(r["left"] for r in rows)
+    cap = sum(r["lim"] for r in rows) or 1
+    ok = m.get("llm.ok_rate") or 0
+    p95 = m.get("llm.latency_p95") or 6000
+    reqs = int(m.get("llm.requests.total") or 0)
+    notes = sql("SELECT count(*) AS n FROM notes WHERE status='active'")
+    notes_n = notes[0].get("n", 0) if notes and "_error" not in notes[0] else 0
+    food = int(100 * left / cap)
+    alive = int(max(0, min(100, ok)))
+    swift = int(max(0, min(100, 100 - min(p95, 6000) / 60)))
+    badges = []
+    if reqs >= 100: badges.append("сотня")
+    if reqs >= 500: badges.append("тысячник")
+    if alive >= 80: badges.append("снайпер")
+    if food >= 70: badges.append("сытый")
+    if notes_n >= 15: badges.append("хранитель")
+    if not badges: badges.append("новичок")
+    fed_recent, hunger, idle_min = mia_feed()
+    # настроение Мии: сначала голод и сон, потом болезнь, потом радость
+    if idle_min > 30:
+        mood = "sleep"
+    elif hunger > 70:
+        mood = "hungry"
+    elif alive < 60:
+        mood = "sick"
+    elif food >= 60 and alive >= 80 and fed_recent > 0:
+        mood = "happy"
+    else:
+        mood = "idle"
+    return {"name": mia_name(), "food": food, "alive": alive, "swift": swift,
+            "level": 1 + reqs // 100, "xp": reqs % 100, "reqs": reqs, "notes": notes_n,
+            "badges": badges, "mood": mood, "fed_recent": fed_recent, "hunger": hunger,
+            "idle_min": idle_min, "quotaLeft": left, "quotaCap": cap}
+
+
+MIA_TASK = os.path.expanduser("~/dev/mia-project/bin/mia-task")
+TASKS_SETTINGS = os.path.expanduser("~/dev/mia-project/tasks/settings.json")
+MIA_SETTINGS = os.path.expanduser("~/.cache/mia-web/settings.json")
+
+
+def mia_settings():
+    settings = {"mode": "chat"}
+    try:
+        with open(MIA_SETTINGS) as f:
+            settings.update(json.load(f))
+    except Exception:
+        pass
+    return settings
+
+
+def set_mia_mode(mode):
+    os.makedirs(os.path.dirname(MIA_SETTINGS), exist_ok=True)
+    with open(MIA_SETTINGS, "w") as f:
+        json.dump({"mode": mode}, f)
+
+
+def task_cli(args, timeout: int = 30):
+    """Вызов CLI очереди задач (mia-task). Возвращает (код, вывод)."""
+    try:
+        p = subprocess.run([MIA_TASK] + list(args), capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or p.stderr or "").strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def tasks_state():
+    """Состояние панели задач: список задач + настройки (авто/режим доступа)."""
+    rc, out = task_cli(["json", "--limit", "30"])
+    tasks = []
+    if out.startswith("["):
+        try:
+            tasks = json.loads(out)
+        except Exception:
+            tasks = []
+    settings = {"auto": False, "mode": "edit"}
+    try:
+        with open(TASKS_SETTINGS) as f:
+            settings.update(json.load(f))
+    except Exception:
+        pass
+    return {"tasks": tasks, "settings": settings,
+            "mia": mia_settings(),
+            "error": None if out.startswith("[") else out[:200]}
+
+
+UI_DIR = "/tmp/mia-ui"
+
+
+def ui_pending():
+    """Очередь команд для страницы: выдаём каждую РОВНО ОДИН РАЗ.
+
+    Выданная команда переносится в подкаталог taken/ — иначе маска cmd-*.json подхватывала бы
+    её снова и снова (на этом я уже обжёгся: получалось cmd-…taken.taken.taken.json, и одна
+    команда выполнялась каждую секунду, засыпав Мию одинаковыми сообщениями).
+    """
+    base = pathlib.Path(UI_DIR)
+    taken_dir = base / "taken"
+    taken_dir.mkdir(parents=True, exist_ok=True)
+    out = []
+    for f in sorted(base.glob("cmd-*.json"), key=lambda x: x.name)[:5]:     # только верхний уровень
+        if ".taken." in f.name or f.parent != base:
+            continue
+        try:
+            if time.time() - f.stat().st_mtime > 120:                       # окно было закрыто — не выполняем
+                f.rename(taken_dir / (f.name + ".stale"))
+                continue
+            dst = taken_dir / f.name
+            f.rename(dst)                                                    # выдали и убрали из очереди
+            out.append({"id": f.stem, "js": json.loads(dst.read_text())["js"]})
+        except Exception:
+            continue
+    for old in taken_dir.glob("cmd-*.json"):                                 # подчищаем отработавшие
+        try:
+            if time.time() - old.stat().st_mtime > 600:
+                old.unlink()
+        except Exception:
+            pass
+    return out
+
+
+def ui_result(cmd_id: str, ok: bool, value: str) -> None:
+    try:
+        with open(pathlib.Path(UI_DIR) / "results.jsonl", "a") as f:
+            f.write(json.dumps({"id": cmd_id, "ok": ok, "value": value,
+                                "ts": datetime.now().strftime("%H:%M:%S")}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def mia_persona() -> str:
+    """Характер Мии берётся из базы (brand:persona) — меняется в одном месте, без правки кода."""
+    try:
+        rows = sql("SELECT body FROM notes WHERE key='brand:persona'")
+        if rows and rows[0].get("body"):
+            return rows[0]["body"].strip()
+    except Exception:
+        pass
+    return ("Ты — Мия, девушка-хакер, живёшь в этом приложении и помогаешь хозяину во всём. "
+            "Отвечай по-русски, живо и коротко, без канцелярита и лести. Не выдумывай факты: "
+            "если не знаешь — скажи прямо.")
+
+
+def rag_find(q: str, limit: int = 3):
+    """Фрагменты базы знаний для RAG: компактный текст для промпта + ключи источников."""
+    try:
+        p = subprocess.run([DB_CLI, "find", q, "--limit", str(limit)],
+                           capture_output=True, text=True, timeout=60)
+        lines = [l.rstrip() for l in (p.stdout or "").splitlines() if l.strip()]
+    except Exception as e:
+        return "", [], [f"поиск не удался: {e}"], None, False
+
+    keys, ctx, raw, sims = [], [], [], []
+    for l in lines:
+        low = l.strip()
+        m = re.match(r"^\[(\d+)\]\s+(\S+)\s*(.*)$", low)
+        if m:
+            keys.append(m.group(2))
+            ctx.append(f"[{m.group(1)}] {m.group(2)} — {m.group(3)}".strip())
+            raw.append(l)
+        elif low.startswith(("·", "(")):
+            continue                                  # служебные строки поисковика в промпт не идут
+        else:
+            ctx.append(low)
+            raw.append(l)
+            for sim in re.findall(r"смысл\s+([01]\.\d+)", low):
+                sims.append(float(sim))
+    best = max(sims) if sims else None
+    # порог: у поиска своя уверенность, но нам важно «опиралась ли она на базу»
+    used = bool(keys) and (best is None or best >= 0.45)
+    return "\n".join(ctx[:60]), keys, raw, best, used
+
+
+CHAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts TEXT NOT NULL,
+  role TEXT NOT NULL, content TEXT NOT NULL, summarized INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS chat_summaries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, ts TEXT NOT NULL,
+  from_id INTEGER, to_id INTEGER, text TEXT NOT NULL, note_key TEXT, model TEXT);
+CREATE INDEX IF NOT EXISTS chat_msg_session_idx ON chat_messages(session, id);
+"""
+
+CHAT_SESSION = "main"          # один постоянный диалог с Мией
+CHAT_WINDOW = 12               # сколько последних сообщений идёт дословно
+CHAT_CHUNK = 8                 # сколько старых сворачивается в саммэри за раз
+CHAT_SUMMARIES_IN_PROMPT = 3   # сколько саммэри подмешиваем в контекст
+TASK_RE = re.compile(r"<task>\s*(\{.*?\})\s*</task>", re.S)
+
+
+def chat_db():
+    con = sqlite3.connect(DB_PATH, timeout=5)
+    con.row_factory = sqlite3.Row
+    con.executescript(CHAT_SCHEMA)
+    con.commit()
+    return con
+
+
+def chat_remember(role: str, content: str) -> None:
+    try:
+        con = chat_db()
+        con.execute("INSERT INTO chat_messages (session, ts, role, content) VALUES (?,?,?,?)",
+                    (CHAT_SESSION, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), role, content))
+        con.commit()
+    except Exception:
+        pass
+
+
+def chat_history(limit: int = CHAT_WINDOW):
+    """Последние сообщения дословно — в порядке разговора (без текущего вопроса)."""
+    try:
+        rows = sql("SELECT role, content FROM chat_messages WHERE session=? ORDER BY id DESC LIMIT ?",
+                   (CHAT_SESSION, limit))
+        return [r for r in reversed(rows) if "role" in r]        # служебные строки ошибок не берём
+    except Exception:
+        return []
+
+
+def chat_summary_text(limit: int = CHAT_SUMMARIES_IN_PROMPT) -> str:
+    try:
+        rows = sql("SELECT ts, text FROM chat_summaries WHERE session=? ORDER BY id DESC LIMIT ?",
+                   (CHAT_SESSION, limit))
+        return "\n".join(f"[{r['ts'][:16]}] {r['text']}" for r in reversed(rows) if "text" in r)
+    except Exception:
+        return ""
+
+
+def tasks_brief(limit: int = 8) -> str:
+    """Компактная очередь задач для контекста Мии — чтобы она знала, что происходит."""
+    rc, out = task_cli(["json", "--limit", str(limit)])
+    if not out.startswith("["):
+        return ""
+    try:
+        tasks = json.loads(out)
+    except Exception:
+        return ""
+    if not tasks:
+        return "задач нет"
+    words = {"new": "ждёт старта", "queued": "в очереди", "running": "работает",
+             "ok": "готово", "failed": "УПАЛА", "cancelled": "отменена"}
+    lines = []
+    for t in tasks:
+        note = f" — {str(t.get('error') or t.get('result') or '')[:80]}" if t.get("status") == "failed" else ""
+        lines.append(f"{t.get('n')} [{words.get(t.get('status'), t.get('status'))}] {t.get('title')}{note}")
+    return "\n".join(lines)
+
+
+def make_task_from_chat(spec: dict) -> dict:
+    """Создаёт задачу по просьбе Мии (блок <task>{…}</task> в её ответе)."""
+    title = (spec.get("title") or "").strip()[:140]
+    brief = (spec.get("brief") or "").strip()
+    if not title or not brief:
+        return {"ok": False, "error": "нет title или brief"}
+    args = ["add", "--title", title, "--brief-file", "-", "--source", "chat"]
+    if spec.get("mode") in ("read", "edit", "full"):
+        args += ["--mode", spec["mode"]]
+    try:
+        p = subprocess.run([MIA_TASK] + args, input=brief, capture_output=True, text=True, timeout=30)
+        first = (p.stdout or p.stderr or "").strip().splitlines()[0] if (p.stdout or p.stderr) else ""
+        number = first.split(" ")[0] if first else ""
+        return {"ok": p.returncode == 0, "n": number, "title": title, "out": p.stdout.strip()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:120]}
+
+
+def summarize_chat() -> dict:
+    """Сворачивает старые сообщения в саммэри быстрой бесплатной моделью и пишет его в базу знаний.
+
+    Саммэри становится обычной записью agentdb — значит, её находит тот же RAG, что и остальные
+    знания: ничего отдельного искать не нужно.
+    """
+    # Замок обязателен: сворачивание запускается фоном на каждую реплику, и без него два потока
+    # успевали свернуть один и тот же кусок дважды (проверено: две одинаковые саммэри подряд).
+    global _SUMMARIZE_LOCK
+    try:
+        _SUMMARIZE_LOCK
+    except NameError:
+        _SUMMARIZE_LOCK = open("/tmp/mia-summarize.lock", "w")
+    try:
+        fcntl.flock(_SUMMARIZE_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return {"ok": True, "skipped": "сворачивание уже идёт"}
+
+    try:
+        con = chat_db()
+        rows = con.execute("SELECT id, role, content FROM chat_messages WHERE session=? AND summarized=0 "
+                           "ORDER BY id LIMIT ?", (CHAT_SESSION, CHAT_CHUNK)).fetchall()
+        pending = con.execute("SELECT count(*) FROM chat_messages WHERE session=? AND summarized=0",
+                              (CHAT_SESSION,)).fetchone()[0]
+        if pending < CHAT_WINDOW or len(rows) < CHAT_CHUNK:
+            return {"ok": True, "skipped": f"мало сообщений ({pending})"}
+        dialog = "\n".join(f"{'ты' if r['role'] == 'user' else 'Мия'}: {r['content'][:400]}" for r in rows)
+        prompt = ("Сожми этот кусок разговора в короткое саммэри (не больше 700 символов), по-русски, "
+                  "строго по блокам: ЗАДАЧА / СДЕЛАНО / ФАКТЫ / ОТКРЫТО. Без воды и без вступлений.\n\n" + dialog)
+        body = {"model": "chat", "temperature": 0.3, "max_tokens": 400,
+                "messages": [{"role": "user", "content": prompt}]}
+        req = urllib.request.Request(ROUTER + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **UA})
+        with urllib.request.urlopen(req, timeout=90) as r:
+            d = json.load(r)
+        text = ((d.get("choices") or [{}])[0].get("message") or {}).get("content", "").strip()
+        if not text:
+            return {"ok": False, "error": "модель вернула пусто"}
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        key = f"memory:chat-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        con.execute("INSERT INTO chat_summaries (session, ts, from_id, to_id, text, note_key, model) "
+                    "VALUES (?,?,?,?,?,?,?)", (CHAT_SESSION, ts, rows[0]["id"], rows[-1]["id"], text, key,
+                                               d.get("model") or ""))
+        con.execute("UPDATE chat_messages SET summarized=1 WHERE id BETWEEN ? AND ?",
+                    (rows[0]["id"], rows[-1]["id"]))
+        con.commit()
+        # саммэри — в базу знаний (фоном: запись получит эмбеддинг и станет искомой по смыслу)
+        try:
+            subprocess.Popen([DB_CLI, "add", "--kind", "memory", "--key", key, "--topic", "memory",
+                              "--title", f"Память разговора {ts[:16]}", "--tags", "память,разговор",
+                              "--body-file", "-"], stdin=subprocess.PIPE, text=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).communicate(text)
+        except Exception:
+            pass
+        return {"ok": True, "chars": len(text), "note": key, "messages": len(rows)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:160]}
+
+
+def chat_with_mia(q: str):
+    """Ответ Мии: личность + память (саммэри и последние реплики) + очередь задач + RAG.
+
+    Если в ответе есть блок <task>{…}</task> — задача создаётся, а блок из текста убирается.
+    """
+    try:
+        chat_db().close()            # таблицы памяти должны существовать ДО чтения истории
+    except Exception:
+        pass
+    ctx, keys, raw, bestSim, used = rag_find(q)
+    persona = mia_persona()
+    mia_mode = mia_settings().get("mode", "chat")
+    tasks = tasks_brief()
+    memory = chat_summary_text()
+    history = chat_history()
+
+    parts = [persona]
+    parts.append("ТЕКУЩИЕ ЗАДАЧИ (их ставит пользователь, выполняет раннер на бесплатных моделях):\n"
+                 + (tasks or "нет данных"))
+    if memory:
+        parts.append("ПАМЯТЬ О ПРОШЛЫХ РАЗГОВОРАХ (саммэри, старые реплики забыты):\n" + memory)
+    if used:
+        parts.append("ФРАГМЕНТЫ БАЗЫ ЗНАНИЙ по вопросу (это факты, ссылайся на них):\n" + (ctx or ""))
+    else:
+        parts.append("В базе знаний надёжных данных нет — отвечай своими знаниями и скажи об этом. "
+                     "Не выдумывай пути, команды и цифры.")
+    parts.append(
+        "КАК СТАВИТЬ ЗАДАЧИ: если пользователь просит что-то сделать (проверить, написать, починить, разобрать), "
+        "ответь обычным текстом и в самом конце добавь отдельным блоком:\n"
+        '<task>{"title": "кратко", "brief": "ПОЛНЫЙ промпт по шаблону: РОЛЬ, КОНТЕКСТ (пути и факты), ЗАДАЧА, '
+        'ОГРАНИЧЕНИЯ, КРИТЕРИИ, ДОКАЗАТЕЛЬСТВА, ФОРМАТ, САМОПРОВЕРКА", "mode": "read|edit|full"}</task>\n'
+        "Промпт пиши так, чтобы его выполнил отдельный агент без доступа к этому разговору: конкретные пути, "
+        "критерии приёмки, требование доказательств. Не ставь задачу, если тебя просто спрашивают.")
+    system = "\n\n".join(parts)
+
+    messages = [{"role": "system", "content": system}]
+    for h in history:
+        messages.append({"role": "user" if h["role"] == "user" else "assistant",
+                         "content": (h["content"] or "")[:1500]})
+    messages.append({"role": "user", "content": q})
+
+    body = {"model": "chat", "temperature": 0.6, "max_tokens": 900, "messages": messages}
+    try:
+        req = urllib.request.Request(ROUTER + "/v1/chat/completions",
+                                     data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", **UA})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            d = json.load(r)
+        ch = (d.get("choices") or [{}])[0]
+        answer = ((ch.get("message") or {}).get("content") or "").strip()
+        if not answer:
+            raise RuntimeError("модель вернула пустой ответ")
+    except Exception as e:
+        chat_remember("user", q)
+        return {"answer": "", "model": "", "sources": keys, "found": len(keys), "lines": raw,
+                "usedBase": used, "bestSim": bestSim, "error": str(e)[:200]}
+
+    answer, task = answer, None
+    m = TASK_RE.search(answer)
+    if m:
+        if mia_mode != "agent":
+            task = {"ok": False, "error": "режим чата: задачи доступны только в режиме агента"}
+        else:
+            try:
+                task = make_task_from_chat(json.loads(m.group(1)))
+            except Exception as e:
+                task = {"ok": False, "error": f"разбор блока задачи: {e}"[:120]}
+        answer = TASK_RE.sub("", answer).strip()
+
+    chat_remember("user", q)
+    chat_remember("assistant", answer)
+    threading.Thread(target=summarize_chat, daemon=True).start()   # сворачивание — фоном
+
+    return {"answer": answer, "model": d.get("model") or "", "sources": keys, "found": len(keys),
+            "lines": raw, "usedBase": used, "bestSim": bestSim, "task": task}
+
+
+def ask_system(q: str):
+    try:
+        p = subprocess.run([DB_CLI, "find", q, "--limit", "4"], capture_output=True, text=True, timeout=90)
+        return {"q": q, "lines": [l for l in (p.stdout or p.stderr or "").splitlines() if l.strip()][:40]}
+    except Exception as e:
+        return {"q": q, "lines": [f"ошибка обращения: {e}"]}
+
+
+# --------------------------------------------------------------------- сервер
+def stream_events():
+    """Генератор строк SSE от роутера: передаём как есть, чтобы браузер анимировал живой поток."""
+    try:
+        req = urllib.request.Request(ROUTER + "/events", headers={"Accept": "text/event-stream", **UA})
+        with urllib.request.urlopen(req, timeout=3600) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").rstrip("\n")
+                if line.strip():
+                    yield line
+                else:
+                    yield ""
+    except Exception as e:
+        yield f": router unavailable ({e})"
+    yield ": stream closed"
+
+
+class Handler(SimpleHTTPRequestHandler):
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=WEB_DIR, **kw)
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        try:
+            if path == "/api/live":
+                usage = router_json("/usage")
+                metrics = metrics_rows()
+                return self._json({"usage": usage, "limits": limits_rows(usage),
+                                   "journal": journal_rows(), "pet": pet_state(usage, metrics),
+                                   "at": datetime.now().strftime("%H:%M:%S")})
+            if path == "/api/heavy":
+                return self._json({"doctor": router_json("/doctor?tokens=40000", 6),
+                                   "metrics": metrics_rows(), "models": models_rows(),
+                                   "knowledge": knowledge()})
+            if path == "/api/flows":
+                lim = 12
+                for part in query.split("&"):
+                    if part.startswith("limit="):
+                        lim = max(1, min(50, int(part[6:] or 12)))
+                return self._json(flows(lim))
+            if path == "/api/stream":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+                for line in stream_events():
+                    self.wfile.write((line + "\n").encode("utf-8"))
+                    self.wfile.flush()
+                return
+            if path == "/api/ui":            # очередь команд для страницы (тесты интерфейса)
+                return self._json({"commands": ui_pending()})
+            if path == "/api/memory":        # что Мия помнит: саммэри и окно сообщений
+                return self._json({"summaries": chat_summary_text(5), "window": len(chat_history(50)),
+                                   "text": chat_summary_text(5)})
+            if path == "/api/tasks":        # очередь задач Мии для панели
+                return self._json(tasks_state())
+            if path == "/api/identity":      # лаунчер понимает, что порт занят именно нашим окном
+              return self._json({"app": "mia-web", "port": self.server.server_address[1],
+                                 "pid": os.getpid()})
+            if path == "/api/version":
+                return self._json({"v": web_version()})
+            if path == "/api/usage":
+                return self._json(router_json("/usage"))
+            if path == "/api/doctor":
+                return self._json(router_json("/doctor?tokens=40000", 6))
+            if path == "/api/health":
+                return self._json({"app": "mia-web", "pid": os.getpid(),
+                                   "uptimeSec": max(0, int(time.monotonic() - STARTED_AT)),
+                                   "router": router_health(),
+                                   "journalAgeSec": journal_age_sec(),
+                                   "tasks": task_counts(),
+                                   "ts": datetime.now().strftime("%H:%M:%S")})
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as e:
+            return self._json({"_error": str(e)}, 500)
+        return super().do_GET()
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b"{}"
+        try:
+            body = json.loads(raw or b"{}")
+        except Exception:
+            body = {}
+        if path == "/api/summarize":       # свернуть старые реплики в саммэри (вручную/таймером)
+            return self._json(summarize_chat())
+        if path == "/api/ui/result":     # чем закончилась команда
+            ui_result(str(body.get("id") or ""), bool(body.get("ok")), str(body.get("value") or "")[:2000])
+            return self._json({"ok": True})
+        if path == "/api/task":                      # действие над задачей: start | cancel
+            i = str(body.get("id") or "").strip()
+            action = str(body.get("action") or "").strip()
+            if action not in ("start", "cancel") or not i:
+                return self._json({"ok": False, "error": "нужны id и action=start|cancel"}, 400)
+            rc, out = task_cli([action, i])
+            return self._json({"ok": rc == 0, "out": out})
+        if path == "/api/settings":                  # свитчи панели и режим Мии
+            if body.get("mia_mode") in ("chat", "agent"):
+                set_mia_mode(body["mia_mode"])
+            args = ["settings"]
+            if "auto" in body:
+                args += ["--auto", "on" if body.get("auto") else "off"]
+            if body.get("mode") in ("read", "edit", "full"):
+                args += ["--mode", body["mode"]]
+            rc, out = task_cli(args)
+            return self._json({"ok": rc == 0, "out": out, **tasks_state()})
+        if path == "/api/chat":
+          q = (body.get("q") or "").strip()
+          if not q:
+              return self._json({"answer": "", "error": "пустой вопрос"}, 400)
+          return self._json(chat_with_mia(q))
+        if path == "/api/ask":
+            q = (body.get("q") or "").strip()
+            if not q:
+                return self._json({"q": "", "lines": ["пустой вопрос"]}, 400)
+            return self._json(ask_system(q))
+        if path == "/api/jslog":
+            print(f"[js] {(body.get('msg') or '')[:300]}", file=sys.stderr, flush=True)
+            return self._json({"ok": True})
+        return self._json({"_error": "неизвестный путь"}, 404)
+
+
+# Приложение старается занять один и тот же порт: иначе localStorage (переписка и выбранная тема)
+# привязывается к origin с портом и пропадает при каждом запуске. Если порт занят — берём свободный.
+DEFAULT_PORT = 8790   # занят роутером был 8791 — проверяем свободу перед стартом
+
+
+def port_free(port: int) -> bool:
+    """Свободен ли порт. SO_REUSEADDR обязателен: без него сокет предыдущего запуска
+    в состоянии TIME_WAIT выглядит занятым, и приложение каждый раз уходило на случайный порт
+    (а вместе с портом терялись переписка и выбранная тема из localStorage)."""
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def serve(port: int) -> ThreadingHTTPServer:
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--server-only", action="store_true")
+    ap.add_argument("--size", default="1400x900")
+    a = ap.parse_args()
+
+    # Единственный экземпляр: если наш же сервер уже отвечает на постоянном порту, второе окно не нужно
+    # (иначе каждая лишняя попытка запуска поднимала ещё одно приложение и ещё одну «10» область).
+    if not a.port and not port_free(DEFAULT_PORT):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{DEFAULT_PORT}/api/identity", timeout=3) as r:
+                ident = json.load(r)
+            if ident.get("app") == "mia-web":
+                print(f"mia-web: уже запущено (pid {ident.get('pid')}, порт {DEFAULT_PORT})", flush=True)
+                return 0
+        except Exception:
+            pass                                       # порт занят чужим — берём свободный ниже
+
+    port = a.port or (DEFAULT_PORT if port_free(DEFAULT_PORT) else free_port())
+    serve(port)
+    url = f"http://127.0.0.1:{port}/"
+    print(f"mia-web: {url}", flush=True)
+
+    PID_FILE = "/tmp/mia-web.pid"                       # лаунчер по нему понимает, что окно живо
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+    if a.server_only or not os.environ.get("DISPLAY"):
+        print("mia-web: режим только-сервер (Ctrl+C для выхода)", flush=True)
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
+        return 0
+
+    import gi
+    gi.require_version("Gtk", "3.0")
+    gi.require_version("WebKit2", "4.1")
+    from gi.repository import Gtk, WebKit2
+
+    w, h = (int(x) for x in a.size.lower().split("x"))
+    win = Gtk.Window(title="Mia · панель")
+    win.set_default_size(w, h)
+    win.set_position(Gtk.WindowPosition.CENTER)
+    win.set_wmclass("mia-web", "mia-web")
+    view = WebKit2.WebView()
+    view.load_uri(url)
+    win.add(view)
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    try:
+        Gtk.main()
+    finally:
+        try:
+            if os.path.exists(PID_FILE) and open(PID_FILE).read().strip() == str(os.getpid()):
+                os.unlink(PID_FILE)
+        except Exception:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

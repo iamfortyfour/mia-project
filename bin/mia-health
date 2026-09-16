@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# mia-health — сторож приложения Mia: раз в 5 минут проверяет /api/health и реагирует на зависание.
+#
+# Зачем: приложение может замереть, и это выясняется случайно (именно так и случилось 2026-09-16).
+# Поведение при двух провалах подряд:
+#   • процесса нет          → запускаю заново (~/.local/bin/mia-launch идемпотентен);
+#   • процесс жив, но молчит → НЕ перезапускаю молча (в окне может быть работа пользователя),
+#                              а пишу это в лог и уведомляю Dunst.
+# Всегда возвращает 0: это проверка, а её результат виден в логе и уведомлении.
+set -u
+
+URL="${MIA_URL:-http://127.0.0.1:8790/api/health}"
+LOG="$HOME/.cache/mia-health.log"
+FAILS=/tmp/mia-health.fails
+LASTOK=/tmp/mia-health.lastok
+mkdir -p "$(dirname "$LOG")"
+
+resp=$(curl -s --max-time 5 -w '\n%{http_code}' "$URL" 2>/dev/null)
+code=$(printf '%s' "$resp" | tail -1)
+body=$(printf '%s' "$resp" | sed '$d')
+now=$(date '+%Y-%m-%d %H:%M:%S')
+
+# живым считаем ответ, который действительно JSON нашего приложения (а не HTML-заглушка)
+ok=0
+if [ "$code" = "200" ] && printf '%s' "$body" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("app")=="mia-web" else 1)' 2>/dev/null; then
+    ok=1
+fi
+
+if [ "$ok" = "1" ]; then
+    echo 0 > "$FAILS"
+    # в лог — не чаще раза в час, иначе он распухнет
+    if [ ! -f "$LASTOK" ] || [ $(( $(date +%s) - $(stat -c %Y "$LASTOK") )) -ge 3600 ]; then
+        detail=$(printf '%s' "$body" | jq -r '"router=\(.router.ok) \(.router.ms)мс · активность журнала \(.journalAgeSec)с назад · задач \(.tasks.queued)/\(.tasks.running)"' 2>/dev/null)
+        printf '%s ok   %s\n' "$now" "$detail" >> "$LOG"
+        touch "$LASTOK"
+    fi
+    exit 0
+fi
+
+n=$(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$FAILS"
+printf '%s FAIL код=%s провалов_подряд=%s\n' "$now" "${code:-нет}" "$n" >> "$LOG"
+
+if [ "$n" -ge 2 ]; then
+    pid=$(pgrep -f 'bin/[m]ia-web' | head -1)
+    if [ -n "$pid" ]; then
+        msg="процесс жив (pid $pid), но приложение не отвечает — перезапуск не делаю, нужен твой взгляд"
+    else
+        msg="процесса нет — запускаю заново"
+        "$HOME/.local/bin/mia-launch" >/dev/null 2>&1
+    fi
+    printf '%s %s\n' "$now" "$msg" >> "$LOG"
+    if command -v dunstify >/dev/null 2>&1; then
+        dunstify -u critical "Mia не отвечает" "$msg" >/dev/null 2>&1
+    fi
+    echo 0 > "$FAILS"
+fi
+exit 0
